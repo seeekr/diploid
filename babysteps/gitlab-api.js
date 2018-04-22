@@ -17,6 +17,12 @@ const log = normalizeLogger(bunyan.createLogger({
 
 const glConf = JSON.parse(fs.readFileSync('config/env.json', 'utf8'))
 const GITLAB_DOMAIN = glConf.domain
+const REGISTRY_URL = (function () {
+    let {registry} = glConf
+    registry = registry.replace(/^https?:\/\//, '')
+    const [host, port] = registry.split(':')
+    return `${host || GITLAB_DOMAIN}${port ? ':' + port : ''}`
+})()
 const GITLAB_USER = glConf.user
 const GITLAB_TOKEN = glConf.token
 const OPS_PROJECT = glConf.masterRepo
@@ -25,13 +31,6 @@ const gl = new Gitlab({
     url: `https://${GITLAB_DOMAIN}`,
     token: GITLAB_TOKEN,
 })
-const REGISTRY = function () {
-    if (GITLAB_DOMAIN === 'gitlab.com') {
-        return 'registry.gitlab.com'
-    } else {
-        return GITLAB_DOMAIN
-    }
-}()
 
 const ENV_CONF_NAME = `.diploid.conf.js`
 const SOURCE_DIR = 'sources'
@@ -60,8 +59,7 @@ async function main() {
     const repos = _.keyBy(await loadRepos(), 'path')
 
     const services = await Promise.all(
-        (await getServiceConfigs(path.dirname(groupFile))).map(async ([basename, serviceConf]) => {
-            const name = serviceConf.repo || basename
+        (await getServiceConfigs(path.dirname(groupFile))).map(async ([name, serviceConf]) => {
             const conf = _.merge(
                 {},
                 _.omit(groupConf, ['domain', 'services']),
@@ -73,7 +71,7 @@ async function main() {
 
             const service = {name, conf}
 
-            const repo = repos[name]
+            const repo = repos[serviceConf.repo || name]
             if (repo) {
                 // if no hook set yet (determine from db): add a hook for commits to this repo --> for building, updating model, taking action if necessary (e.g. changed ports)
                 console.log(repo.path)
@@ -114,7 +112,7 @@ async function main() {
 
                             let ports = null
                             try {
-                                const imageConfig = await getImageConfig(imagePath, tag, GITLAB_DOMAIN, 4567, GITLAB_USER, GITLAB_TOKEN)
+                                const imageConfig = await getImageConfig(imagePath, tag, GITLAB_DOMAIN, REGISTRY_URL, GITLAB_USER, GITLAB_TOKEN)
                                 ports = getExposedPorts(imageConfig)
                             } catch (e) {
                                 // ignore here, image may not have been built yet
@@ -125,6 +123,7 @@ async function main() {
                                 branch: branch.name,
                                 env,
                                 commit: branch.lastCommit,
+                                prod: branch.prod,
                                 glob: isGlob,
                             }, ports ? {ports} : {})
                         }),
@@ -150,6 +149,7 @@ async function main() {
         name: path.basename(path.dirname(groupFile)),
         file: groupFile.split(opsDir + '/')[1],
         conf: groupConf,
+        repo: Object.values(repos).find(r => r.fullPath === OPS_PROJECT),
         services,
     }
 
@@ -211,122 +211,6 @@ async function loadBranches(pid) {
                 date: moment(b.commit.committed_date).toDate(),
             },
         }))
-}
-
-async function generateDeployment() {
-    const kind = conf.stateful ? 'StatefulSet' : 'Deployment'
-    const labels = {app: name}
-    const namespace = env
-    const items = [
-        {
-            kind,
-            apiVersion: 'apps/v1',
-            metadata: {
-                name,
-                namespace,
-                labels,
-            },
-            spec: {
-                selector: {matchLabels: labels},
-                template: {
-                    metadata: {labels},
-                    spec: {
-                        containers: [
-                            {
-                                name,
-                                image,
-                                ports: ports.map(port => ({containerPort: port})),
-                            },
-                        ],
-                    },
-                },
-            },
-        },
-        {
-            kind: 'Service',
-            apiVersion: 'v1',
-            metadata: {
-                name,
-                namespace,
-                labels,
-            },
-            spec: {
-                ports: ports.map(port => ({port})),
-                selector: labels,
-            },
-        },
-    ]
-    if (conf.ingress == null || conf.ingress) {
-        const annotations = {
-            'kubernetes.io/ingress.class': 'nginx',
-            'kubernetes.io/tls-acme': 'true',
-            'ingress.kubernetes.io/ssl-redirect': 'true',
-        }
-        let [baseDomain, ...attrs] = conf.domain.split(/\s+/)
-        attrs = _.fromPairs(attrs.join(',').split(/[, ]+/).map(it => it.split('=')))
-        if (attrs.mapEnv) {
-            if (attrs.mapEnv !== 'subdomain') {
-                throw new Error('todo')
-            }
-            if (!isProd) {
-                baseDomain = `${env}.${baseDomain}`
-            }
-        }
-        let {url} = conf
-        if (isGlob) {
-            url = `${url}/${branch.name}`
-        }
-        const URL = require('url').URL
-        url = new URL(interpolate(url, {
-            name,
-            namespace,
-            env,
-            domain: baseDomain,
-        }))
-        const domain = url.hostname
-        const path = url.pathname
-
-        const ingress = {
-            kind: 'Ingress',
-            apiVersion: 'extensions/v1beta1',
-            metadata: {
-                name,
-                namespace,
-                labels,
-                annotations,
-            },
-            spec: {
-                tls: [{
-                    hosts: [domain],
-                    secretName: `${domain.replace(/\./g, '-')}-tls`,
-                }],
-                rules: [{
-                    host: domain,
-                    http: {
-                        paths: [{
-                            path,
-                            backend: {serviceName: name, servicePort: ports[0]},
-                        }],
-                    },
-                }],
-            },
-        }
-        if (conf.cors) {
-            Object.assign(annotations, {
-                'ingress.kubernetes.io/enable-cors': 'true',
-                'ingress.kubernetes.io/cors-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'ingress.kubernetes.io/cors-allow-origin': '*',
-                'ingress.kubernetes.io/cors-allow-headers': 'Authorization, Accept, Content-Type',
-                'ingress.kubernetes.io/cors-allow-credentials': 'true',
-            })
-        }
-        items.push(ingress)
-    }
-
-    for (const item of items) {
-        console.log(YAML.safeDump(item, {noRefs: true, noCompatMode: true, lineWidth: 240}))
-        console.log('---\n')
-    }
 }
 
 const parseJs = require('esprima').parse

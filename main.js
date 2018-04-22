@@ -21,9 +21,13 @@ const app = new Koa()
 const Router = require('koa-router')
 const router = new Router()
 
-
+router.post('/gitlab/hook', async ctx => {
+    console.log(ctx.request.body)
+    ctx.status = 200
+})
 
 app
+    .use(require('koa-body')())
     .use(router.routes())
     .use(router.allowedMethods())
 
