@@ -1,0 +1,39 @@
+{
+  "name": "diploid",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seeekr/diploid.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/seeekr/diploid/issues"
+  },
+  "homepage": "https://github.com/seeekr/diploid#readme",
+  "dependencies": {
+    "bunyan": "^1.8.12",
+    "child-process-promise": "^2.2.1",
+    "dotenv": "^5.0.1",
+    "esprima": "^4.0.0",
+    "fs-extra": "^5.0.0",
+    "glob": "^7.1.2",
+    "glob-promise": "^3.4.0",
+    "js-yaml": "^3.11.0",
+    "koa": "^2.5.0",
+    "koa-router": "^7.4.0",
+    "lodash": "^4.17.5",
+    "micromatch": "^3.1.10",
+    "moment": "^2.22.1",
+    "node-gitlab-api": "^3.0.2",
+    "request": "^2.85.0",
+    "request-promise": "^4.2.2",
+    "static-eval": "^2.0.0"
+  }
+}
