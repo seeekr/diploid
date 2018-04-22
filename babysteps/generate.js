@@ -52,6 +52,45 @@ async function main() {
             const kind = conf.stateful ? 'StatefulSet' : 'Deployment'
             const labels = {app: name}
             const namespace = env
+            let [baseDomain, ...domainAttrs] = domain.split(/\s+/)
+            const context = {
+                name,
+                namespace,
+                env,
+                domain: baseDomain,
+            }
+
+            const map = (typeof conf.map === 'string' ? [conf.map] : conf.map || [])
+            const volumes = []
+            const volumeMounts = []
+            for (const item of map) {
+                const parts = item.split(':')
+                const type = parts[0][0] === '/' ? 'host' : parts.shift()
+                const from = parts.shift()
+                const to = parts[0][0] === '/' ? parts.shift() : from
+                const flags = parts
+
+                if (type !== 'host') {
+                    log.error('unknown volume mapping type %s', type)
+                    throw new Error()
+                }
+
+                const hostPath = interpolate(from, context)
+                const mountPath = interpolate(to, context)
+
+                const safeFrom = hostPath.replace(/\W+/g, '-').replace(/^-/, '').replace(/-{2,}/g, '')
+                const name = `${type}-${safeFrom}`
+                volumes.push({
+                    name,
+                    hostPath: {path: hostPath},
+                })
+                volumeMounts.push({
+                    name,
+                    mountPath,
+                    ...(/ro|readonly/i.test(flags.join(',')) ? {readOnly: true} : null),
+                })
+            }
+
             const items = [
                 {
                     kind,
@@ -71,8 +110,10 @@ async function main() {
                                         name,
                                         image,
                                         ports: ports.map(port => ({containerPort: port})),
+                                        volumeMounts,
                                     },
                                 ],
+                                volumes,
                             },
                         },
                     },
@@ -97,10 +138,9 @@ async function main() {
                     'kubernetes.io/tls-acme': 'true',
                     'ingress.kubernetes.io/ssl-redirect': 'true',
                 }
-                let [baseDomain, ...attrs] = domain.split(/\s+/)
-                attrs = _.fromPairs(attrs.join(',').split(/[, ]+/).map(it => it.split('=')))
-                if (attrs.mapEnv) {
-                    if (attrs.mapEnv !== 'subdomain') {
+                domainAttrs = _.fromPairs(domainAttrs.join(',').split(/[, ]+/).map(it => it.split('=')))
+                if (domainAttrs.mapEnv) {
+                    if (domainAttrs.mapEnv !== 'subdomain') {
                         throw new Error('todo')
                     }
                     if (!prod) {
@@ -112,12 +152,7 @@ async function main() {
                     url = `${url}/${branch}`
                 }
                 const URL = require('url').URL
-                url = new URL(interpolate(url, {
-                    name,
-                    namespace,
-                    env,
-                    domain: baseDomain,
-                }))
+                url = new URL(interpolate(url, context))
                 const host = url.hostname
                 const path = url.pathname
 
@@ -133,7 +168,7 @@ async function main() {
                     spec: {
                         tls: [{
                             hosts: [host],
-                            secretName: `${host.replace(/\./g, '-')}-tls`,
+                            secretName: `tls-${host.replace(/\./g, '-')}`,
                         }],
                         rules: [{
                             host: host,
