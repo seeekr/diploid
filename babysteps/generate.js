@@ -1,6 +1,6 @@
 const fs = require('fs-extra')
 const Gitlab = require('node-gitlab-api/dist/es5').default
-const {sh, interpolate, normalizeLogger} = require('../lib/lib')
+const {sh, interpolate, normalizeLogger, splitImage} = require('../lib/lib')
 const {getImageConfig, getExposedPorts} = require('../lib/registry')
 const globFiles = require('glob-promise')
 const glob = require('micromatch')
@@ -38,20 +38,54 @@ async function main() {
     const model = JSON.parse(await fs.readFile('model.json', 'utf8'))
     const {domain} = model.conf
 
-    for (const {name, conf, deployments} of model.services) {
-        if (!deployments) continue
-        for (const {repo, branch, env, commit, glob, prod, ports: _ports} of deployments) {
-            if (!repo) continue
-            const imagePath = `${repo}/${branch}`
-            const tag = commit.short
-            const image = `${REGISTRY_URL}/${imagePath}:${tag}`
+    for (const {name, conf: serviceConf, deployments} of model.services) {
+        let toDeploy
+        if (deployments) {
+            toDeploy = deployments.map(({repo, branch, env, commit, glob, prod, ports}) => ({
+                env,
+                imagePath: `${repo}/${branch}`,
+                tag: commit.short,
+                registry: REGISTRY_URL,
+                branch,
+                glob,
+                prod,
+                ports,
+            }))
+        } else {
+            toDeploy = _.uniq(['production', ...Object.keys(serviceConf.byEnv || {})]).map(env => {
+                const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
+                const [imagePath, tag] = splitImage(conf.image)
+                return {
+                    env,
+                    imagePath,
+                    tag,
+                    prod: env === 'production',
+                    ports: conf.ports,
+                }
+            })
+        }
+        for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports} of toDeploy) {
+            const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
+            const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}`
 
-            // const ports = _ports || getExposedPorts(await getImageConfig(imagePath, tag, GITLAB_DOMAIN, REGISTRY_URL, GITLAB_USER, GITLAB_TOKEN))
-            const ports = _ports || [80]
+            let ports = _ports
+            if (!ports) {
+                try {
+                    ports = getExposedPorts(await getImageConfig(imagePath, tag, registry, GITLAB_DOMAIN, GITLAB_USER, GITLAB_TOKEN))
+                } catch (e) {
+                    ports = [80]
+                }
+            }
 
             const kind = conf.stateful ? 'StatefulSet' : 'Deployment'
             const labels = {app: name}
             const namespace = env
+            let nodeSelector = null
+            if (conf.node) {
+                nodeSelector = {
+                    'kubernetes.io/hostname': conf.node,
+                }
+            }
             let [baseDomain, ...domainAttrs] = domain.split(/\s+/)
             const context = {
                 name,
@@ -90,6 +124,36 @@ async function main() {
                     ...(/ro|readonly/i.test(flags.join(',')) ? {readOnly: true} : null),
                 })
             }
+            let affinity = null
+            if (conf.unique) {
+                if (/\bnode\b/i.test(conf.unique)) {
+                    affinity = {
+                        podAntiAffinity: {
+                            requiredDuringSchedulingIgnoredDuringExecution: [
+                                {
+                                    labelSelector: {matchExpressions: [{key: 'app', operator: 'In', values: [name]}]},
+                                    topologyKey: 'kubernetes.io/hostname',
+                                },
+                            ],
+                        },
+                    }
+                } else {
+                    log.error('only per-node uniqueness value is supported, got: %s -- not generating deployment', conf.unique)
+                    continue
+                }
+            }
+
+            const serviceOpts = (conf.service || '').split(/[, ]+/).reduce((ret, o) => {
+                if (o) {
+                    const [k, v] = o.split('=')
+                    ret[k] = v
+                }
+                return ret
+            }, {})
+            let clusterIP = null
+            if (serviceOpts.proxy && ['0', 'false', 'off', 'no'].includes(serviceOpts.proxy)) {
+                clusterIP = 'None'
+            }
 
             const items = [
                 {
@@ -102,18 +166,28 @@ async function main() {
                     },
                     spec: {
                         selector: {matchLabels: labels},
+                        ...(kind === 'StatefulSet' ? {serviceName: name} : {}),
                         template: {
                             metadata: {labels},
                             spec: {
+                                ...(nodeSelector ? {nodeSelector} : {}),
                                 containers: [
                                     {
                                         name,
                                         image,
                                         ports: ports.map(port => ({containerPort: port})),
+                                        ...(conf.env ? {
+                                            env: Object.entries(conf.env)
+                                                .map(([name, value]) => ({
+                                                    name,
+                                                    value,
+                                                })),
+                                        } : {}),
                                         volumeMounts,
                                     },
                                 ],
                                 volumes,
+                                ...(affinity ? {affinity} : {}),
                             },
                         },
                     },
@@ -128,6 +202,7 @@ async function main() {
                     },
                     spec: {
                         ports: ports.map(port => ({port})),
+                        ...(clusterIP ? {clusterIP} : {}),
                         selector: labels,
                     },
                 },

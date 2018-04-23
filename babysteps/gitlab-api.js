@@ -1,6 +1,6 @@
 const fs = require('fs-extra')
 const Gitlab = require('node-gitlab-api/dist/es5').default
-const {sh, interpolate, normalizeLogger} = require('../lib/lib')
+const {sh, interpolate, normalizeLogger, splitImage} = require('../lib/lib')
 const {getImageConfig, getExposedPorts} = require('../lib/registry')
 const globFiles = require('glob-promise')
 const glob = require('micromatch')
@@ -58,7 +58,7 @@ async function main() {
     const groupEnvConfigs = _.omit(groupConf, ['domain', 'services'])
     const repos = _.keyBy(await loadRepos(), 'path')
 
-    const services = await Promise.all(
+    const services = (await Promise.all(
         (await getServiceConfigs(path.dirname(groupFile))).map(async ([name, serviceConf]) => {
             const conf = _.merge(
                 {},
@@ -110,22 +110,14 @@ async function main() {
                             const imagePath = `${repo.fullPath}/${branch.name}`
                             const tag = branch.lastCommit.short
 
-                            let ports = null
-                            try {
-                                const imageConfig = await getImageConfig(imagePath, tag, GITLAB_DOMAIN, REGISTRY_URL, GITLAB_USER, GITLAB_TOKEN)
-                                ports = getExposedPorts(imageConfig)
-                            } catch (e) {
-                                // ignore here, image may not have been built yet
-                            }
-
-                            return Object.assign({
+                            return await addPorts(Object.assign({
                                 repo: repo.fullPath,
                                 branch: branch.name,
                                 env,
                                 commit: branch.lastCommit,
                                 prod: branch.prod,
                                 glob: isGlob,
-                            }, ports ? {ports} : {})
+                            }), imagePath, tag, true)
                         }),
                 )
                 Object.assign(service, {repo, deployments})
@@ -139,11 +131,14 @@ async function main() {
                     log.error('%s: no repository found for %s and no explicit image configured, cannot generate deployment!', groupFile, name)
                     return service
                 }
+
+                const [imagePath, tag] = splitImage(conf.image)
+                await addPorts(service, imagePath, tag)
             }
 
             return service
         }),
-    )
+    )).filter(it => it)
 
     const group = {
         name: path.basename(path.dirname(groupFile)),
@@ -211,6 +206,19 @@ async function loadBranches(pid) {
                 date: moment(b.commit.committed_date).toDate(),
             },
         }))
+}
+
+async function addPorts(service, imagePath, tag = 'latest', gitlabRegistry = false) {
+    try {
+        const imageConfig = await getImageConfig(imagePath, tag, ...(gitlabRegistry ? [REGISTRY_URL, GITLAB_DOMAIN, GITLAB_USER, GITLAB_TOKEN] : []))
+        const ports = getExposedPorts(imageConfig)
+        if (ports && ports.length) {
+            service.ports = ports
+        }
+    } catch (e) {
+        // ignore here, image may not have been built yet
+    }
+    return service
 }
 
 const parseJs = require('esprima').parse
