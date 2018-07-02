@@ -1,0 +1,91 @@
+# what kind of state do we have here?
+# - url of gitops repo
+# - gitlab token
+# -- the rest is just cache that can be restored from reading the gitops repo & referenced repos
+
+# store state as configMap/secret, map into container, read on startup
+# --> use kubectl to store it in k8s when configured/changes --> same lifetime as k8s cluster itself
+
+# store cache on disk/host volume
+
+# we need:
+# kubectl + kube auth
+# docker daemon
+# docker config.json auth for kaniko
+
+
+# for each build job we need:
+# checked out repo as kaniko build context
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: diploid
+  namespace: diploid
+  labels:
+    app: diploid
+spec:
+  selector:
+    matchLabels:
+      app: diploid
+  template:
+    metadata:
+      labels:
+        app: diploid
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      containers:
+      - name: diploid
+        image: seeekr/diploid
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: config
+          mountPath: /etc/diploid
+      volumes:
+      - name: config
+        configMap:
+          name: diploid-config
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: diploid
+  namespace: diploid
+  labels:
+    app: diploid
+spec:
+  selector:
+    app: diploid
+  ports:
+  - port: 80
+
+---
+
+kind: Ingress
+apiVersion: extensions/v1beta1
+metadata:
+  name: diploid
+  namespace: diploid
+  labels:
+    app: diploid
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    kubernetes.io/tls-acme: true
+    ingress.kubernetes.io/ssl-redirect: true
+spec:
+  tls:
+    - hosts:
+      - diploid.{{domain}}
+      secretName: tls-diploid
+  rules:
+  - host: diploid.{{domain}}
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: diploid
+          servicePort: 80
