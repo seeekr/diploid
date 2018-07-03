@@ -49,11 +49,13 @@ module.exports = {
         // only deploy diploid if necessary, leave making upgrades to 'upgrade' command
         try {
             await sh(`kubectl get deploy -n diploid diploid`)
+            console.log('diploid was already deployed')
         } catch (e) {
             const yaml = hbs.compile(await fs.readFile(`${__dirname}/../../diploid.yaml`, 'utf8'))({domain: config.domain.split(' ')[0]})
             const file = `${os.tmpdir()}/diploid.yaml`
             await fs.writeFile(file, yaml, 'utf8')
             await sh(`kubectl apply -f ${file}`)
+            console.log('deployed diploid server to cluster')
         }
 
         // after this command finished successfully:
