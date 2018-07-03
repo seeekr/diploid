@@ -1,22 +1,3 @@
-# what kind of state do we have here?
-# - url of gitops repo
-# - gitlab token
-# -- the rest is just cache that can be restored from reading the gitops repo & referenced repos
-
-# store state as configMap/secret, map into container, read on startup
-# --> use kubectl to store it in k8s when configured/changes --> same lifetime as k8s cluster itself
-
-# store cache on disk/host volume
-
-# we need:
-# kubectl + kube auth
-# docker daemon
-# docker config.json auth for kaniko
-
-
-# for each build job we need:
-# checked out repo as kaniko build context
-
 kind: Deployment
 apiVersion: apps/v1
 metadata:
@@ -40,13 +21,44 @@ spec:
         image: seeekr/diploid
         ports:
         - containerPort: 80
+        env:
+        - name: CONFIG_DIR
+          value: /etc/diploid
+        - name: SOURCE_DIR
+          value: /data/diploid/source
+        - name: STATE_DIR
+          value: /data/diploid/state
+        - name: USE_GVISOR
+          value: true
+        - name: HOOKS_TOKEN
+          value: AYoi7Yvohzh2BfBJFNY3t10Ej9FbbNYi
         volumeMounts:
         - name: config
           mountPath: /etc/diploid
+          readOnly: true
+        - name: kubernetes-config
+          mountPath: /root/.kube/admin.conf
+          readOnly: true
+        - name: diploid
+          mountPath: /diploid
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
       volumes:
       - name: config
         configMap:
           name: diploid-config
+      - name: kubernetes-config
+        hostPath:
+          path: /etc/kubernetes/admin.conf
+          type: File
+      - name: diploid
+        hostPath:
+          path: /data/diploid
+          type: DirectoryOrCreate
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
 
 ---
 
