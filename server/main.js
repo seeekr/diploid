@@ -162,7 +162,7 @@ async function loadModel() {
         services: {defaults: {}},
     }, safeEval(await fs.readFile(groupFile, 'utf8')))
 
-    const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken']
+    const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken', 'registry', 'user']
     const groupEnvConfigs = _.omit(groupConf, NON_ENV_KEYS)
     const repos = _.keyBy(await loadRepos(), 'path')
 
