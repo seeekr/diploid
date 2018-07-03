@@ -56,14 +56,26 @@ async function init() {
             },
         },
     }
-    await fs.mkdirp(path.dirname(DOCKER_CONFIG))
-    await fs.writeFile(DOCKER_CONFIG, JSON.stringify(dockerConfig), 'utf8')
+
+    {
+        const existed = await fs.exists(DOCKER_CONFIG)
+        const prev = existed && await fs.readFile(DOCKER_CONFIG, 'utf8')
+        if (!existed) {
+            await fs.mkdirp(path.dirname(DOCKER_CONFIG))
+        }
+        const content = JSON.stringify(dockerConfig)
+        if (prev !== content) {
+            await fs.writeFile(DOCKER_CONFIG, content, 'utf8')
+            console.log(`[status] ${existed ? 'updated' : 'created'} docker registry config file`)
+        }
+    }
 
     // create registry credentials for k8s if necessary
     try {
         await sh('kubectl get secret registry -n diploid')
     } catch (e) {
         await sh(`kubectl create secret -n diploid docker-registry registry --docker-server='${getRegistryUrl()}' --docker-username='${config.user}' --docker-password='${config.gitlabToken}' --docker-email='not@val.id'`)
+        console.log(`[status] created docker registry secret`)
     }
 
     gl = new Gitlab({
@@ -85,6 +97,8 @@ async function init() {
         throw new Error(`expected to find exactly one '${ENV_CONF_NAME}' file in project ${config.opsRepo}, found ${groupFiles.length}`)
     }
     groupFile = groupFiles[0]
+
+    console.log(`[status] initialized from group file: ${groupFile}`)
 
     model = await loadModel()
 
@@ -111,6 +125,12 @@ router.post('/gitlab/hook', async ctx => {
         return
     }
 
+    // if the event was caused by us pushing our automated changes, skip processing
+    if (e.commits.every(c => c.message.startsWith('(bot/diploid)'))) {
+        ctx.status = 200
+        return
+    }
+
     // if it's a configured service:
     // - checkout code
     // - build image
@@ -120,14 +140,19 @@ router.post('/gitlab/hook', async ctx => {
     // - do the full run: git update, reload model, deploy all
 
     const path = e.project.path_with_namespace
+    const branch = e.ref.replace(/^refs\/heads\//, '')
     if (path === config.opsRepo) {
+        if (branch !== 'master') {
+            console.log(`watching only master branch of repo ${path}, ignoring changes to branch: ${branch}`)
+            ctx.status = 200
+            return
+        }
         await gitClone(config.opsRepo)
         const model = await loadModel()
         for (const service of model.services) {
             await deploy(model, service)
         }
     } else {
-        const branch = e.ref.replace(/^refs\/heads\//, '')
         const gitDir = await gitClone(path, branch)
         const tag = e.checkout_sha.substr(0, 8)
         const imagePath = `${path}/${branch}`
@@ -279,7 +304,7 @@ async function addHooks(model) {
                 token: HOOKS_TOKEN,
                 enable_ssl_verification: true,
             })
-            console.log(`hook created for ${repo.fullPath}`)
+            console.log(`[status] hook created for ${repo.fullPath}`)
         }
     }
 }
@@ -518,7 +543,26 @@ async function deploy(model, service) {
         const out = items
             .map(it => YAML.safeDump(it, {noRefs: true, noCompatMode: true, lineWidth: 240}))
             .join('\n---\n\n')
-        await fs.writeFile(`${SOURCE_DIR}/${config.opsRepo}/${path.dirname(model.file)}/${name}${prod ? '' : '-' + env}.yaml`, out, 'utf8')
+        const file = `${SOURCE_DIR}/${config.opsRepo}/${path.dirname(model.file)}/${name}${prod ? '' : '-' + env}.yaml`
+        await fs.writeFile(file, out, 'utf8')
+        const status = await git.status()
+        const itemMsg = `deployment yaml for ${model.name}/${name} for env ${env}`
+        if (status.not_added.includes(file)) {
+            await git.add(file)
+            await git.commit(`(bot/diploid) new ${itemMsg}`)
+            console.log(`[status] new ${itemMsg}`)
+        } else if (status.modified.includes(file)) {
+            await git.commit(`(bot/diploid) updated ${itemMsg}`)
+            console.log(`[status] updated ${itemMsg}`)
+        } else {
+            continue
+        }
+        const [origin, current] = status.tracking.split('/')
+        await git.push(origin, current)
+
+        // now we deploy
+        await sh(`kubectl apply -f ${file}`)
+        console.log(`[status] deployed ${model.name}/${name}:${env}`)
     }
 }
 
