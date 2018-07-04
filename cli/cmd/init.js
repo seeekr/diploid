@@ -5,11 +5,18 @@ const fs = require('fs-extra')
 const hbs = require('handlebars')
 const _ = require('lodash')
 
+const git = require('simple-git/promise')('.')
+
 module.exports = {
     command: 'init',
     async handler() {
         if (!await fs.exists('.git')) {
             console.error(`needs to be called from a git repository`)
+            process.exit(1)
+        }
+
+        if ((await git.status()).current !== 'master') {
+            console.error(`only supported branch of ops repo is 'master'; please switch to 'master' first before trying again`)
             process.exit(1)
         }
 

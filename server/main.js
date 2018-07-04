@@ -1,21 +1,3 @@
-// set up routes for hooks: probably just POST /gitlab/push
-// get from env:
-// gitlab personal access token
-// which gitlab project url we're supposed to configure ourselves from, plus path
-
-// on push to deployed project: figure out if we need to take action, and which one, execute it
-// on push to "ops" project: execute the steps below similar to on first run of this tool
-
-
-// checkout gitlab "ops" project
-// (keep it cached; next time do git fetch && git reset --hard origin(/<branch>?))
-// read relevant configuration, validate + normalize
-// if config changed: update/reload our own config
-
-
-// deployment:
-// need full kubectl access
-
 const fs = require('fs-extra')
 const Gitlab = require('node-gitlab-api/dist/es5').default
 const {sh, safeEval, splitImage, interpolate} = require('../lib/lib')
@@ -27,6 +9,7 @@ const _ = require('lodash')
 const moment = require('moment')
 const path = require('path')
 const YAML = require('js-yaml')
+const Git = require('simple-git/promise')
 
 const ENV_CONF_NAME = `.diploid.conf.js`
 
@@ -40,16 +23,16 @@ const USE_GVISOR = process.env.USE_GVISOR != null
 
 const HOOKS_TOKEN = process.env.HOOKS_TOKEN || 'GXqAJyrd0YSqJxJ6gBgx6hnuwaK8AZGO'
 
-const git = require('simple-git/promise')(SOURCE_DIR)
-
-let config, gl, opsDir, model, groupFile
+let bootstrapConfig, config, gl, opsDir, opsGit, model, groupFile
 
 async function init() {
     // load bootstrap config, fetch repo, read full config -- after that we can proceed with full information
-    config = JSON.parse(await fs.readFile(`${CONFIG_DIR}/config.json`, 'utf8'))
+    bootstrapConfig = config = JSON.parse(await fs.readFile(`${CONFIG_DIR}/config.json`, 'utf8'))
 
     await fs.mkdirp(SOURCE_DIR)
     opsDir = await gitClone(config.opsRepo)
+
+    opsGit = new Git(opsDir)
 
     const groupFiles = await findConfigFiles(opsDir)
     if (groupFiles.length !== 1) {
@@ -116,15 +99,16 @@ const router = new Router()
 router.post('/gitlab/hook', async ctx => {
     await _init
 
+    ctx.status = 200
+    ctx.flushHeaders()
+
     const e = ctx.request.body
     if (e.object_kind !== 'push') {
-        ctx.status = 200
         return
     }
 
     // if the event was caused by us pushing our automated changes, skip processing
     if (e.commits.every(c => c.message.startsWith('(bot/diploid)'))) {
-        ctx.status = 200
         return
     }
 
@@ -141,7 +125,6 @@ router.post('/gitlab/hook', async ctx => {
     if (path === config.opsRepo) {
         if (branch !== 'master') {
             console.log(`watching only master branch of repo ${path}, ignoring changes to branch: ${branch}`)
-            ctx.status = 200
             return
         }
         await gitClone(config.opsRepo)
@@ -161,15 +144,13 @@ router.post('/gitlab/hook', async ctx => {
         const service = model.services.find(it => it.repo.id === e.project.id)
         if (!service) {
             console.log(`no configured service found with id #${e.project.id}`)
-            ctx.status = 200
             return
         }
 
-        await deploy(model, service)
+        await deploy(model, service, branch)
     }
 
-    console.log(ctx.request.body)
-    ctx.status = 200
+    console.log('done processing request')
 })
 
 app
@@ -179,10 +160,21 @@ app
 
 app.listen(3000)
 
+function normalizeDomain(config) {
+    if (config.domain) {
+        let [domain, ...domainAttrs] = config.domain.split(/\s+/)
+        domainAttrs = _.fromPairs(domainAttrs.join(',').split(/[, ]+/).map(it => it.split('=')))
+        Object.assign(config, {domain, domainAttrs})
+    }
+    return config
+}
+
 async function loadModel() {
+    console.log('(re-)loading model')
     const groupConf = _.merge({
         services: {defaults: {}},
-    }, safeEval(await fs.readFile(groupFile, 'utf8')))
+    }, bootstrapConfig, safeEval(await fs.readFile(groupFile, 'utf8')))
+    normalizeDomain(groupConf)
 
     const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken', 'registry', 'user']
     const groupEnvConfigs = _.omit(groupConf, NON_ENV_KEYS)
@@ -284,6 +276,7 @@ async function loadModel() {
 }
 
 async function addHooks(model) {
+    console.log(`ensuring hooks are set`)
     // hook for
     // - ops project
     // - all services that were matched to a repo
@@ -308,7 +301,8 @@ async function addHooks(model) {
     }
 }
 
-async function deploy(model, service) {
+async function deploy(model, service, onlyBranch = null) {
+    console.log(`going to deploy ${model.name}/${service.name}:${onlyBranch || '(all envs)'}`)
     const {name, conf: serviceConf, deployments} = service
     let toDeploy
     if (deployments) {
@@ -336,13 +330,15 @@ async function deploy(model, service) {
         })
     }
     for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports} of toDeploy) {
+        if (onlyBranch && branch !== onlyBranch) continue
+
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
         const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}`
 
         let ports = _ports
         if (!ports) {
             try {
-                ports = getExposedPorts(await getImageConfig(imagePath, tag, registry, config.domain, config.user, config.gitlabToken))
+                ports = getExposedPorts(await getImageConfig(imagePath, tag, registry, config.gitlab, config.user, config.gitlabToken))
             } catch (e) {
                 ports = [80]
             }
@@ -357,7 +353,15 @@ async function deploy(model, service) {
                 'kubernetes.io/hostname': conf.node,
             }
         }
-        let [baseDomain, ...domainAttrs] = config.domain.split(/\s+/)
+        let {domain: baseDomain, domainAttrs} = config
+        if (domainAttrs.mapEnv) {
+            if (domainAttrs.mapEnv !== 'subdomain') {
+                throw new Error('todo')
+            }
+            if (!prod) {
+                baseDomain = `${env}.${baseDomain}`
+            }
+        }
         const context = {
             name,
             namespace,
@@ -484,15 +488,6 @@ async function deploy(model, service) {
                 'kubernetes.io/tls-acme': 'true',
                 'ingress.kubernetes.io/ssl-redirect': 'true',
             }
-            domainAttrs = _.fromPairs(domainAttrs.join(',').split(/[, ]+/).map(it => it.split('=')))
-            if (domainAttrs.mapEnv) {
-                if (domainAttrs.mapEnv !== 'subdomain') {
-                    throw new Error('todo')
-                }
-                if (!prod) {
-                    baseDomain = `${env}.${baseDomain}`
-                }
-            }
             let {url} = conf
             if (glob) {
                 url = `${url}/${branch}`
@@ -544,20 +539,22 @@ async function deploy(model, service) {
             .join('\n---\n\n')
         const file = `${SOURCE_DIR}/${config.opsRepo}/${path.dirname(model.file)}/${name}${prod ? '' : '-' + env}.yaml`
         await fs.writeFile(file, out, 'utf8')
-        const status = await git.status()
+        const status = await opsGit.status()
         const itemMsg = `deployment yaml for ${model.name}/${name} for env ${env}`
-        if (status.not_added.includes(file)) {
-            await git.add(file)
-            await git.commit(`(bot/diploid) new ${itemMsg}`)
+        const relFile = path.relative(`${SOURCE_DIR}/${config.opsRepo}`, file)
+        if (status.not_added.includes(relFile)) {
+            await opsGit.add(relFile)
+            await opsGit.commit(`(bot/diploid) new ${itemMsg}`, relFile)
             console.log(`[status] new ${itemMsg}`)
-        } else if (status.modified.includes(file)) {
-            await git.commit(`(bot/diploid) updated ${itemMsg}`)
+        } else if (status.modified.includes(relFile)) {
+            await opsGit.commit(`(bot/diploid) updated ${itemMsg}`, relFile)
             console.log(`[status] updated ${itemMsg}`)
         } else {
+            console.log(`[status] unchanged, skipping ${itemMsg}`)
             continue
         }
         const [origin, current] = status.tracking.split('/')
-        await git.push(origin, current)
+        await opsGit.push(origin, current)
 
         // now we deploy
         await sh(`kubectl apply -f ${file}`)
@@ -615,12 +612,12 @@ function getRegistryUrl() {
     let {registry} = config
     registry = registry.replace(/^https?:\/\//, '')
     const [host, port] = registry.split(':')
-    return `${host || config.domain}${port ? ':' + port : ''}`
+    return `${host || config.gitlab}${port ? ':' + port : ''}`
 }
 
 async function addPorts(service, imagePath, tag = 'latest', gitlabRegistry = false) {
     try {
-        const imageConfig = await getImageConfig(imagePath, tag, ...(gitlabRegistry ? [getRegistryUrl(), config.domain, config.user, config.gitlabToken] : []))
+        const imageConfig = await getImageConfig(imagePath, tag, ...(gitlabRegistry ? [getRegistryUrl(), config.gitlab, config.user, config.gitlabToken] : []))
         const ports = getExposedPorts(imageConfig)
         if (ports && ports.length) {
             service.ports = ports
