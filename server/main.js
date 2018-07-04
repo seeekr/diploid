@@ -1,3 +1,5 @@
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+
 const fs = require('fs-extra')
 const Gitlab = require('node-gitlab-api/dist/es5').default
 const {sh, safeEval, splitImage, interpolate} = require('../lib/lib')
@@ -96,7 +98,7 @@ const app = new Koa()
 const Router = require('koa-router')
 const router = new Router()
 
-router.post('/gitlab/hook', async ctx => {
+router.post('/gitlab/hook', async function gitlabHook(ctx) {
     await _init
 
     ctx.status = 200
@@ -108,7 +110,7 @@ router.post('/gitlab/hook', async ctx => {
     }
 
     // if the event was caused by us pushing our automated changes, skip processing
-    if (e.commits.every(c => c.message.startsWith('(bot/diploid)'))) {
+    if (e.commits.length && e.commits.every(c => c.message.startsWith('(bot/diploid)'))) {
         console.log('skipping processing of our own events')
         return
     }
@@ -134,12 +136,7 @@ router.post('/gitlab/hook', async ctx => {
             await deploy(model, service)
         }
     } else {
-        const gitDir = await gitClone(path, branch)
-        const tag = e.checkout_sha.substr(0, 8)
-        const imagePath = `${path}/${branch}`
-
-        const runtimeArg = USE_GVISOR ? '--runtime=runsc' : ''
-        await sh(`docker run ${runtimeArg} --rm -v ${gitDir}:/workspace -v ${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${getRegistryUrl()}/${imagePath}:${tag}'`)
+        await build(path, branch, e.checkout_sha.substr(0, 8))
 
         const model = await loadModel()
         const service = model.services.find(it => it.repo.id === e.project.id)
@@ -335,13 +332,36 @@ async function deploy(model, service, onlyBranch = null) {
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
         const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}`
+
+        let imageConfig
+        try {
+            imageConfig = await getImageConfig(imagePath, tag, registry, config.gitlab, config.user, config.gitlabToken)
+        } catch (e) {
+            if (e.statusCode === 404) {
+                // image is not there
+            } else {
+                console.log('failed to read image config', e)
+            }
+        }
+        if (service.repo) {
+            const repoPath = service.repo.fullPath
+            const gitDir = gitClone(repoPath, branch, tag)
+            if (!imageConfig) {
+                if (!await fs.exists(`${gitDir}/Dockerfile`)) {
+                    console.log(`[status] image ${imagePath}:${tag} does not exist in registry ${registry}, and no Dockerfile in repo ${repoPath} branch ${branch} at ${tag} either -- cannot build, skipping!`)
+                    continue
+                }
+                await build(repoPath, branch, tag)
+            }
+        }
+
         const name = serviceName + (prod || !branch ? '' : `-${branch}`)
 
         let ports = _ports
         if (!ports) {
-            try {
-                ports = getExposedPorts(await getImageConfig(imagePath, tag, registry, config.gitlab, config.user, config.gitlabToken))
-            } catch (e) {
+            if (imageConfig) {
+                ports = getExposedPorts(imageConfig)
+            } else {
                 ports = [80]
             }
         }
@@ -460,7 +480,7 @@ async function deploy(model, service, onlyBranch = null) {
                                         env: Object.entries(conf.env)
                                             .map(([name, value]) => ({
                                                 name,
-                                                value,
+                                                value: typeof value === 'boolean' ? `${value}` : value,
                                             })),
                                     } : {}),
                                     volumeMounts,
@@ -572,14 +592,32 @@ async function deploy(model, service, onlyBranch = null) {
     }
 }
 
-async function gitClone(path, branch = null) {
-    const targetDir = `${SOURCE_DIR}/${path}${branch ? '/' + branch : ''}`
+async function build(path, branch, tag) {
+    const gitDir = await gitClone(path, branch, tag)
+
+    const imagePath = `${path}/${branch}`
+
+    const runtimeArg = USE_GVISOR ? '--runtime=runsc' : ''
+    await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${getRegistryUrl()}/${imagePath}:${tag}'`)
+}
+
+function getGitPath(path, branch) {
+    return `${SOURCE_DIR}/${path}${branch ? '/' + branch : ''}`
+}
+
+async function gitClone(path, branch = null, tag = null) {
+    const targetDir = getGitPath(path, branch)
     if (!await fs.exists(targetDir)) {
         await sh(`git clone 'https://${config.user}:${config.gitlabToken}@${config.gitlab}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
+        if (tag) {
+            await sh(`cd ${targetDir} git checkout ${tag}`)
+        }
     } else if (await fs.exists(`${targetDir}/.git`)) {
-        await sh(`cd ${targetDir} && git fetch --all`)
+        // later/bug: assuming that default branch is "master", which could be completely wrong
+        await sh(`cd ${targetDir} && git fetch --all && git checkout ${tag || branch || 'master'}`)
     } else if (process.env.NODE_ENV === 'dev') {
         // OK to work with predefined non-git folder in development
+        return targetDir
     } else {
         // but not in production!
         throw new Error(`folder ${targetDir} exists, but is not a git repository`)
