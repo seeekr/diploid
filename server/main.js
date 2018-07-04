@@ -45,7 +45,27 @@ const git = require('simple-git/promise')(SOURCE_DIR)
 let config, gl, opsDir, model, groupFile
 
 async function init() {
+    // load bootstrap config, fetch repo, read full config -- after that we can proceed with full information
     config = JSON.parse(await fs.readFile(`${CONFIG_DIR}/config.json`, 'utf8'))
+
+    await fs.mkdirp(SOURCE_DIR)
+    opsDir = await gitClone(config.opsRepo)
+
+    const groupFiles = await findConfigFiles(opsDir)
+    if (groupFiles.length !== 1) {
+        throw new Error(`expected to find exactly one '${ENV_CONF_NAME}' file in project ${config.opsRepo}, found ${groupFiles.length}`)
+    }
+    groupFile = groupFiles[0]
+
+    console.log(`[status] initialized from group file: ${groupFile}`)
+
+    gl = new Gitlab({
+        url: `https://${config.gitlab}`,
+        token: config.gitlabToken,
+    })
+
+    model = await loadModel()
+    config = model.conf
 
     // create docker config.json with registry auth
     const dockerConfig = {
@@ -78,37 +98,14 @@ async function init() {
         console.log(`[status] created docker registry secret`)
     }
 
-    gl = new Gitlab({
-        url: `https://${config.domain}`,
-        token: config.gitlabToken,
-    })
-
-    // on daemon start:
-    // go through all configured gitlab/master repo entries
-    // add hook to master repo if not present
-    // build up the models if not already in the db
-    // add hooks to all relevant repos if not present
-
-    await fs.mkdirp(SOURCE_DIR)
-    opsDir = await gitClone(config.opsRepo)
-
-    const groupFiles = findConfigFiles(opsDir)
-    if (groupFiles.length !== 1) {
-        throw new Error(`expected to find exactly one '${ENV_CONF_NAME}' file in project ${config.opsRepo}, found ${groupFiles.length}`)
-    }
-    groupFile = groupFiles[0]
-
-    console.log(`[status] initialized from group file: ${groupFile}`)
-
-    model = await loadModel()
-
     await addHooks(model)
 }
 
 const _init = init()
+    .then(() => console.log(`[status] ready to deploy group "${model.name}" with ${model.services.length} services: ${model.services.map(s => s.name).join(', ')}`))
     .catch(e => {
-        console.error(`failed: ${e.message || e}`, e)
-        throw e
+        console.error(`failed!`, e)
+        process.exit(1)
     })
 
 const Koa = require('koa')
@@ -282,6 +279,8 @@ async function loadModel() {
     const out = JSON.stringify(group, null, 4)
     await fs.mkdirp(STATE_DIR)
     await fs.writeFile(`${STATE_DIR}/${group.name}.json`, out, 'utf8')
+
+    return group
 }
 
 async function addHooks(model) {
@@ -569,7 +568,7 @@ async function deploy(model, service) {
 async function gitClone(path, branch = null) {
     const targetDir = `${SOURCE_DIR}/${path}${branch ? '/' + branch : ''}`
     if (!await fs.exists(targetDir)) {
-        await sh(`git clone 'https://${config.user}:${config.gitlabToken}@${config.domain}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
+        await sh(`git clone 'https://${config.user}:${config.gitlabToken}@${config.gitlab}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
     } else if (await fs.exists(`${targetDir}/.git`)) {
         await sh(`cd ${targetDir} && git fetch --all`)
     } else if (process.env.NODE_ENV === 'dev') {

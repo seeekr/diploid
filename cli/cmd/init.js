@@ -19,7 +19,7 @@ module.exports = {
             process.exit(1)
         }
         if (configFiles.length > 1) {
-            console.error(`only a single diploid configuratino file is currently allowed, found ${configFiles.length}: ${configFiles.join(', ')}`)
+            console.error(`only a single diploid configuration file is currently allowed, found ${configFiles.length}: ${configFiles.join(', ')}`)
             process.exit(1)
         }
 
@@ -29,8 +29,12 @@ module.exports = {
             await sh(`kubectl create ns diploid`)
         }
 
-        const opsRepo = (await sh(`git config remote.origin.url`)).replace(/^git@([^:]+):(.+)$/, '$1/$2')
-        const config = {...safeEval(await fs.readFile(configFiles[0], 'utf8')), opsRepo}
+        const [_url, gitlab, opsRepo] = /^([^/]+)(.+)$/.exec(
+            (await sh(`git config remote.origin.url`))
+                .replace(/^git@([^:]+):(.+)$/, '$1/$2')
+                .replace(/^https?:\/\//, ''),
+        )
+        const config = {...safeEval(await fs.readFile(configFiles[0], 'utf8')), gitlab, opsRepo}
 
         const stateFile = `${os.tmpdir()}/diploid-cm.json`
         await fs.writeFile(stateFile, JSON.stringify({
@@ -41,7 +45,7 @@ module.exports = {
                 namespace: 'diploid',
                 labels: {app: 'diploid'},
             },
-            data: {'config.json': JSON.stringify(_.pick(config, 'opsRepo', 'gitlabToken'))},
+            data: {'config.json': JSON.stringify(_.pick(config, 'gitlab', 'opsRepo', 'user', 'gitlabToken'))},
         }), 'utf8')
 
         await sh(`kubectl apply -f ${stateFile}`)

@@ -29,7 +29,7 @@ spec:
         - name: STATE_DIR
           value: /data/diploid/state
         - name: USE_GVISOR
-          value: true
+          value: "true"
         - name: HOOKS_TOKEN
           value: AYoi7Yvohzh2BfBJFNY3t10Ej9FbbNYi
         volumeMounts:
