@@ -109,6 +109,7 @@ router.post('/gitlab/hook', async ctx => {
 
     // if the event was caused by us pushing our automated changes, skip processing
     if (e.commits.every(c => c.message.startsWith('(bot/diploid)'))) {
+        console.log('skipping processing of our own events')
         return
     }
 
@@ -303,7 +304,7 @@ async function addHooks(model) {
 
 async function deploy(model, service, onlyBranch = null) {
     console.log(`going to deploy ${model.name}/${service.name}:${onlyBranch || '(all envs)'}`)
-    const {name, conf: serviceConf, deployments} = service
+    const {name: serviceName, conf: serviceConf, deployments} = service
     let toDeploy
     if (deployments) {
         toDeploy = deployments.map(({repo, branch, env, commit, glob, prod, ports}) => ({
@@ -334,6 +335,7 @@ async function deploy(model, service, onlyBranch = null) {
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
         const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}`
+        const name = serviceName + (prod || !branch ? '' : `-${branch}`)
 
         let ports = _ports
         if (!ports) {
@@ -345,7 +347,10 @@ async function deploy(model, service, onlyBranch = null) {
         }
 
         const kind = conf.stateful ? 'StatefulSet' : 'Deployment'
-        const labels = {app: name}
+        const labels = {app: serviceName}
+        if (!prod && branch) {
+            Object.assign(labels, {branch})
+        }
         const namespace = env
         let nodeSelector = null
         if (conf.node) {
@@ -537,7 +542,7 @@ async function deploy(model, service, onlyBranch = null) {
         const out = items
             .map(it => YAML.safeDump(it, {noRefs: true, noCompatMode: true, lineWidth: 240}))
             .join('\n---\n\n')
-        const file = `${SOURCE_DIR}/${config.opsRepo}/${path.dirname(model.file)}/${name}${prod ? '' : '-' + env}.yaml`
+        const file = `${SOURCE_DIR}/${config.opsRepo}/${path.dirname(model.file)}/${serviceName}${prod ? '' : `-${env}${branch ? '-' + branch : ''}`}.yaml`
         await fs.writeFile(file, out, 'utf8')
         const status = await opsGit.status()
         const itemMsg = `deployment yaml for ${model.name}/${name} for env ${env}`
@@ -557,6 +562,11 @@ async function deploy(model, service, onlyBranch = null) {
         await opsGit.push(origin, current)
 
         // now we deploy
+        try {
+            await sh(`kubectl create ns ${namespace}`)
+        } catch (e) {
+            // already exists
+        }
         await sh(`kubectl apply -f ${file}`)
         console.log(`[status] deployed ${model.name}/${name}:${env}`)
     }
