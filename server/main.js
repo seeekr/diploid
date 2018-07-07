@@ -1,8 +1,7 @@
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
-
 const fs = require('fs-extra')
 const Gitlab = require('node-gitlab-api/dist/es5').default
 const {sh, safeEval, splitImage, interpolate} = require('../lib/lib')
+const {loadServiceConfig} = require('../lib/config')
 const {getImageConfig, getExposedPorts} = require('../lib/registry')
 const {findConfigFiles} = require('../lib/diploid')
 const globFiles = require('glob-promise')
@@ -136,8 +135,6 @@ router.post('/gitlab/hook', async function gitlabHook(ctx) {
             await deploy(model, service)
         }
     } else {
-        await build(path, branch, e.checkout_sha.substr(0, 8))
-
         const model = await loadModel()
         const service = model.services.find(it => it.repo.id === e.project.id)
         if (!service) {
@@ -145,6 +142,21 @@ router.post('/gitlab/hook', async function gitlabHook(ctx) {
             return
         }
 
+        // XXX in loadModel() we load whatever latest revision we get of the repo
+        // that we're getting this event for, and it might not be the same revision
+        // as we're getting notified about... inconsistencies could happen!
+
+        const deployment = service.deployments.find(it => it.branch === branch)
+        if (!deployment) {
+            console.log(`configuration mismatch: no deployment found configured for service ${service.name}/${branch}`)
+            return
+        }
+        if (deployment.commit.id !== e.checkout_sha) {
+            console.log(`error: push event sha ${e.checkout_sha} -- latest available through git repo ${deployment.commit.id} -- not deploying!`)
+            return
+        }
+
+        await build(path, branch, e.checkout_sha.substr(0, 8))
         await deploy(model, service, branch)
     }
 
@@ -225,17 +237,15 @@ async function loadModel() {
                                     isGlob = curGlob
                                 }
                             }
-                            const imagePath = `${repo.fullPath}/${branch.name}`
-                            const tag = branch.lastCommit.short
 
-                            return await addPorts(Object.assign({
+                            return {
                                 repo: repo.fullPath,
                                 branch: branch.name,
                                 env,
                                 commit: branch.lastCommit,
                                 prod: branch.prod,
                                 glob: isGlob,
-                            }), imagePath, tag, true)
+                            }
                         }),
                 )
                 Object.assign(service, {repo, deployments})
@@ -252,6 +262,14 @@ async function loadModel() {
 
                 const [imagePath, tag] = splitImage(conf.image)
                 await addPorts(service, imagePath, tag)
+            }
+
+            // check for additional required build steps
+            if (conf.configure) {
+                if (!repo) {
+                    console.error(`'configure' option is only valid for services with a repository (and thus build step), but service '${name}' is based on a prebuilt image -- ignoring this option`)
+                    return service
+                }
             }
 
             return service
@@ -331,7 +349,7 @@ async function deploy(model, service, onlyBranch = null) {
         if (onlyBranch && branch !== onlyBranch) continue
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
-        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}`
+        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}` + (serviceConf.configure ? `-${env}` : '')
 
         let imageConfig
         try {
@@ -351,7 +369,7 @@ async function deploy(model, service, onlyBranch = null) {
                     console.log(`[status] image ${imagePath}:${tag} does not exist in registry ${registry}, and no Dockerfile in repo ${repoPath} branch ${branch} at ${tag} either -- cannot build, skipping!`)
                     continue
                 }
-                await build(repoPath, branch, tag)
+                await build(service, branch, tag)
             }
         }
 
@@ -592,13 +610,162 @@ async function deploy(model, service, onlyBranch = null) {
     }
 }
 
-async function build(path, branch, tag) {
+async function build(service, branch, tag) {
+    const path = service.repo.fullPath
     const gitDir = await gitClone(path, branch, tag)
 
-    const imagePath = `${path}/${branch}`
+    const image = `${getRegistryUrl()}/${path}/${branch}:${tag}`
 
     const runtimeArg = USE_GVISOR ? '--runtime=runsc' : ''
-    await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${getRegistryUrl()}/${imagePath}:${tag}'`)
+    await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${image}'`)
+
+    const {configure} = service.conf
+    if (!configure) return
+
+    const tmpDir = await fs.mkdtemp(os.tmpdir() + '/')
+    for (const {env, prod, branch} of service.deployments.filter(it => it.branch === branch)) {
+        const envDir = `${tmpDir}/${env}`
+        for (const [file, props] of configure.entries()) {
+            // copy file from container
+            const content = await sh(`docker run --rm ${image} cat ${file}`)
+            const type = path.extname(file).replace(/^\./, '')
+            let loadFn, dumpFn
+            if (['yaml', 'yml'].includes(type)) {
+                loadFn = YAML.safeLoad
+                dumpFn = YAML.safeDump
+            } else {
+                console.log(`unsupported file type: ${file}`)
+                break
+            }
+            const o = loadFn(content)
+            // apply modifications
+            for (const [k, v] of props.entries()) {
+                const items = k.split(' ')
+                let path, attrs = {}
+                for (const item of items) {
+                    const ix = item.indexOf('=')
+                    if (ix === -1) {
+                        if (path) {
+                            console.log(`invalid key ${k}, ignoring ${path}`)
+                            continue
+                        }
+                        path = item
+                    }
+                    else attrs[item.substring(0, ix)] = item.substr(ix + 1)
+                }
+                let forEnv
+                for (const [ak, av] of attrs.entries()) {
+                    if (ak === 'env') {
+                        forEnv = av
+                    } else {
+                        console.log(`unknown attr ${ak}, ignoring`)
+                    }
+                }
+                if (forEnv && forEnv !== env) continue
+                const pathEls = path.split('.')
+                const last = pathEls[pathEls.length - 1]
+                const ix = last.indexOf('*')
+                let match
+                if (ix !== -1) {
+                    match = last
+                    pathEls.splice(pathEls.length - 1, 1)
+                }
+                let cur = o
+                for (const pathEl of pathEls) {
+                    if (!(pathEl in cur)) {
+                        cur[pathEl] = {}
+                    }
+                    cur = cur[pathEl]
+                }
+
+                // normalize RHS
+                let rhs = v
+                if (typeof rhs === 'object' && rhs.__pathExr__) {
+                    const context = {
+                        services: model.services.map(s => {
+                            const host = s.name + (prod || !branch ? '' : `-${branch}`)
+                            const port = s.ports && s.ports[0]
+                            return _.merge(
+                                {host, port},
+                                s.conf,
+                                (s.conf.byEnv || {})[env],
+                            )
+                        }),
+                    }
+                    rhs = _.merge({}, rhs, _.get(context, rhs.__pathExr__))
+                }
+
+                // apply
+                if (match) {
+                    if (typeof rhs !== 'object') {
+                        console.log(`we have a property-match intention for ${k}, but right-hand side is not an object: ${JSON.stringify(rhs)} -- skipping`)
+                        continue
+                    }
+                    const re = new RegExp(last.replace('*', '(.*)'))
+                    const done = {}
+                    const targetKeys = Object.keys(rhs)
+                    const matchingSourceKeys = Object.keys(cur).map(it => {
+                        const m = it.match(re)
+                        if (m) {
+                            return m[1]
+                        }
+                    }).filter(it => it)
+                    for (const key of matchingSourceKeys) {
+                        const matching = targetKeys.filter(k => k.toLowerCase().indexOf(key.toLowerCase()) !== -1)
+                        if (matching.length === 1) {
+                            done[matching[0]] = true
+                            _.merge(cur, {[key]: rhs[matching[0]]})
+                        }
+                        // (later) more (error) handling here would be nice
+                    }
+                    let rhsCommonPrefix, lhsStub, caseMod
+                    for (const [rhk, rhv] of rhs.entries()) {
+                        if (done[rhk]) continue
+                        if (!rhsCommonPrefix) {
+                            rhsCommonPrefix = commonPrefix(targetKeys)
+                            lhsStub = last.replace('*', '')
+                            if (matchingSourceKeys.length) {
+                                const chars = matchingSourceKeys.join('').replace(/[^a-z]/ig, '')
+                                if (/[a-z]+/.test(chars)) {
+                                    caseMod = 'Lower'
+                                } else if (/[A-Z]+/.test(chars)) {
+                                    caseMod = 'Upper'
+                                }
+                            }
+                        }
+                        let key = rhk
+                        if (rhsCommonPrefix && rhsCommonPrefix !== lhsStub) {
+                            key = key.substr(rhsCommonPrefix.length)
+                        }
+                        if (caseMod) {
+                            key = key[`to${caseMod}Key`]()
+                        }
+                        _.merge(cur, {[last.replace('*', key)]: rhv})
+                    }
+                } else {
+                    _.merge(cur, rhs)
+                }
+            }
+            // dump file back out
+            await fs.mkdirp(`${envDir}/${path.dirname(file)}`)
+            await fs.writeFile(`${envDir}/${file}`, dumpFn(o), 'utf8')
+        }
+        // write Dockerfile
+        await fs.writeFile(`${envDir}/Dockerfile`, `FROM ${image}\n` + Object.keys(configure).map(f => `COPY ${f} ${f}`).join('\n'), 'utf8')
+        // send off to kaniko to build
+        const envImage = `${image}-${env}`
+        await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${envDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${envImage}'`)
+        await fs.remove(envDir)
+    }
+    await fs.remove(tmpDir)
+}
+
+function commonPrefix(array) {
+    const arr = array.concat().sort(),
+        a1 = arr[0], a2 = arr[arr.length - 1]
+    let i = 0
+    while (i < a1.length && a1.charAt(i) === a2.charAt(i)) i++
+    return a1.substring(0, i)
 }
 
 function getGitPath(path, branch) {
@@ -626,7 +793,10 @@ async function gitClone(path, branch = null, tag = null) {
 }
 
 async function getServiceConfigs(dir) {
-    return await Promise.all((await globFiles(`${dir}/*.k8s.js`)).map(async f => [path.basename(f, '.k8s.js'), safeEval(await fs.readFile(f, 'utf8'))]))
+    return await Promise.all(
+        (await globFiles(`${dir}/*.k8s.js`))
+            .map(async f => [path.basename(f, '.k8s.js'), loadServiceConfig(await fs.readFile(f, 'utf8'))]),
+    )
 }
 
 async function loadRepos() {

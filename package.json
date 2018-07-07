@@ -7,7 +7,7 @@
     "diploid": "cli/index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "mocha"
   },
   "repository": {
     "type": "git",
@@ -41,6 +41,11 @@
     "request-promise": "^4.2.2",
     "simple-git": "^1.96.0",
     "static-eval": "^2.0.0",
-    "yargs": "^12.0.1"
+    "yargs": "^12.0.1",
+    "estraverse": "latest",
+    "escodegen": "latest"
+  },
+  "devDependencies": {
+    "mocha": "^5.2.0"
   }
 }
