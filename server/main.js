@@ -674,7 +674,6 @@ async function build(service, branch, tag) {
     console.log(`[status] additional post-build configuration steps for ${image}`)
 
     const tmpDir = await fs.mkdtemp(os.tmpdir() + '/')
-    console.log(tmpDir)
     for (const depl of service.deployments.filter(it => it.branch === branch)) {
         const {env} = depl
         const envDir = `${tmpDir}/${env}`
