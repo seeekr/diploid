@@ -180,6 +180,29 @@ router.post('/gitlab/hook', async function gitlabHook(ctx) {
     console.log('done processing request')
 })
 
+router.post(`/deploy/:service/:env`, async function deployRoute(ctx) {
+    if (!DEV && ctx.headers['authorization'] !== HOOKS_TOKEN) {
+        ctx.status = 403
+        return
+    }
+
+    await _init
+
+    const {service: serviceName, env} = ctx.params
+
+    const service = model.services.find(it => it.name === serviceName)
+    if (!service) {
+        ctx.status = 404
+        return
+    }
+
+    if (!await deploy(model, service, null, env)) {
+        ctx.status = 404
+    } else {
+        ctx.status = 200
+    }
+})
+
 app
     .use(require('koa-body')())
     .use(router.routes())
