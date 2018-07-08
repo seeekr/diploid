@@ -1,7 +1,8 @@
 const fs = require('fs-extra')
+const os = require('os')
 const Gitlab = require('node-gitlab-api/dist/es5').default
-const {sh, safeEval, splitImage, interpolate} = require('../lib/lib')
-const {loadServiceConfig} = require('../lib/config')
+const {sh, safeEval, splitImage, interpolate, normalizeLogger} = require('../lib/lib')
+const {loadServiceConfig, processConfigure} = require('../lib/config')
 const {getImageConfig, getExposedPorts} = require('../lib/registry')
 const {findConfigFiles} = require('../lib/diploid')
 const globFiles = require('glob-promise')
@@ -11,6 +12,13 @@ const moment = require('moment')
 const path = require('path')
 const YAML = require('js-yaml')
 const Git = require('simple-git/promise')
+const bunyan = require('bunyan')
+const log = normalizeLogger(bunyan.createLogger({
+    name: 'diploid',
+    stream: process.stdout,
+    level: 'trace',
+    serializers: bunyan.stdSerializers,
+}))
 
 const ENV_CONF_NAME = `.diploid.conf.js`
 
@@ -623,132 +631,18 @@ async function build(service, branch, tag) {
     if (!configure) return
 
     const tmpDir = await fs.mkdtemp(os.tmpdir() + '/')
-    for (const {env, prod, branch} of service.deployments.filter(it => it.branch === branch)) {
+    for (const depl of service.deployments.filter(it => it.branch === branch)) {
+        const {env} = depl
         const envDir = `${tmpDir}/${env}`
-        for (const [file, props] of configure.entries()) {
-            // copy file from container
-            const content = await sh(`docker run --rm ${image} cat ${file}`)
-            const type = path.extname(file).replace(/^\./, '')
-            let loadFn, dumpFn
-            if (['yaml', 'yml'].includes(type)) {
-                loadFn = YAML.safeLoad
-                dumpFn = YAML.safeDump
-            } else {
-                console.log(`unsupported file type: ${file}`)
-                break
-            }
-            const o = loadFn(content)
-            // apply modifications
-            for (const [k, v] of props.entries()) {
-                const items = k.split(' ')
-                let path, attrs = {}
-                for (const item of items) {
-                    const ix = item.indexOf('=')
-                    if (ix === -1) {
-                        if (path) {
-                            console.log(`invalid key ${k}, ignoring ${path}`)
-                            continue
-                        }
-                        path = item
-                    }
-                    else attrs[item.substring(0, ix)] = item.substr(ix + 1)
-                }
-                let forEnv
-                for (const [ak, av] of attrs.entries()) {
-                    if (ak === 'env') {
-                        forEnv = av
-                    } else {
-                        console.log(`unknown attr ${ak}, ignoring`)
-                    }
-                }
-                if (forEnv && forEnv !== env) continue
-                const pathEls = path.split('.')
-                const last = pathEls[pathEls.length - 1]
-                const ix = last.indexOf('*')
-                let match
-                if (ix !== -1) {
-                    match = last
-                    pathEls.splice(pathEls.length - 1, 1)
-                }
-                let cur = o
-                for (const pathEl of pathEls) {
-                    if (!(pathEl in cur)) {
-                        cur[pathEl] = {}
-                    }
-                    cur = cur[pathEl]
-                }
-
-                // normalize RHS
-                let rhs = v
-                if (typeof rhs === 'object' && rhs.__pathExr__) {
-                    const context = {
-                        services: model.services.map(s => {
-                            const host = s.name + (prod || !branch ? '' : `-${branch}`)
-                            const port = s.ports && s.ports[0]
-                            return _.merge(
-                                {host, port},
-                                s.conf,
-                                (s.conf.byEnv || {})[env],
-                            )
-                        }),
-                    }
-                    rhs = _.merge({}, rhs, _.get(context, rhs.__pathExr__))
-                }
-
-                // apply
-                if (match) {
-                    if (typeof rhs !== 'object') {
-                        console.log(`we have a property-match intention for ${k}, but right-hand side is not an object: ${JSON.stringify(rhs)} -- skipping`)
-                        continue
-                    }
-                    const re = new RegExp(last.replace('*', '(.*)'))
-                    const done = {}
-                    const targetKeys = Object.keys(rhs)
-                    const matchingSourceKeys = Object.keys(cur).map(it => {
-                        const m = it.match(re)
-                        if (m) {
-                            return m[1]
-                        }
-                    }).filter(it => it)
-                    for (const key of matchingSourceKeys) {
-                        const matching = targetKeys.filter(k => k.toLowerCase().indexOf(key.toLowerCase()) !== -1)
-                        if (matching.length === 1) {
-                            done[matching[0]] = true
-                            _.merge(cur, {[key]: rhs[matching[0]]})
-                        }
-                        // (later) more (error) handling here would be nice
-                    }
-                    let rhsCommonPrefix, lhsStub, caseMod
-                    for (const [rhk, rhv] of rhs.entries()) {
-                        if (done[rhk]) continue
-                        if (!rhsCommonPrefix) {
-                            rhsCommonPrefix = commonPrefix(targetKeys)
-                            lhsStub = last.replace('*', '')
-                            if (matchingSourceKeys.length) {
-                                const chars = matchingSourceKeys.join('').replace(/[^a-z]/ig, '')
-                                if (/[a-z]+/.test(chars)) {
-                                    caseMod = 'Lower'
-                                } else if (/[A-Z]+/.test(chars)) {
-                                    caseMod = 'Upper'
-                                }
-                            }
-                        }
-                        let key = rhk
-                        if (rhsCommonPrefix && rhsCommonPrefix !== lhsStub) {
-                            key = key.substr(rhsCommonPrefix.length)
-                        }
-                        if (caseMod) {
-                            key = key[`to${caseMod}Key`]()
-                        }
-                        _.merge(cur, {[last.replace('*', key)]: rhv})
-                    }
-                } else {
-                    _.merge(cur, rhs)
-                }
-            }
+        const processed = Promise.all(
+            configure.entries()
+                .map(async ([file, props]) => [file, await sh(`docker run --rm ${image} cat ${file}`), props]),
+        )
+            .map(([file, props, content]) => processConfigure(model, depl, file, props, content))
+        for (const [file, content] of processed) {
             // dump file back out
             await fs.mkdirp(`${envDir}/${path.dirname(file)}`)
-            await fs.writeFile(`${envDir}/${file}`, dumpFn(o), 'utf8')
+            await fs.writeFile(`${envDir}/${file}`, content, 'utf8')
         }
         // write Dockerfile
         await fs.writeFile(`${envDir}/Dockerfile`, `FROM ${image}\n` + Object.keys(configure).map(f => `COPY ${f} ${f}`).join('\n'), 'utf8')
@@ -758,14 +652,6 @@ async function build(service, branch, tag) {
         await fs.remove(envDir)
     }
     await fs.remove(tmpDir)
-}
-
-function commonPrefix(array) {
-    const arr = array.concat().sort(),
-        a1 = arr[0], a2 = arr[arr.length - 1]
-    let i = 0
-    while (i < a1.length && a1.charAt(i) === a2.charAt(i)) i++
-    return a1.substring(0, i)
 }
 
 function getGitPath(path, branch) {
