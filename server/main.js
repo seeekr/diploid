@@ -680,7 +680,7 @@ async function build(service, branch, tag) {
         const envDir = `${tmpDir}/${env}`
         const processed = (await Promise.all(
             Object.entries(configure)
-                .map(async ([file, props]) => [file, props, await sh(`docker run --rm ${image} cat ${file}`)]),
+                .map(async ([file, props]) => [file, props, await sh(`docker run --rm ${image} bash -c '[[ -f ${file} ]] && cat ${file} || true'`)]),
         ))
             .map(([file, props, content]) => processConfigure(model, depl, file, props, content))
         for (const [file, content] of processed) {
