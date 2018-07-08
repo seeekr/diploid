@@ -23,6 +23,7 @@ describe('config', function () {
                         },
                     },
                 ],
+                conf: {},
             }
             const fileInput = {
                 parameters: {

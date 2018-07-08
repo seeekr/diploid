@@ -226,7 +226,7 @@ async function loadModel() {
     }, bootstrapConfig, safeEval(await fs.readFile(groupFile, 'utf8')))
     normalizeDomain(groupConf)
 
-    const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken', 'registry', 'user']
+    const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken', 'registry', 'user', 'vars']
     const groupEnvConfigs = _.omit(groupConf, NON_ENV_KEYS)
     const repos = _.keyBy(await loadRepos(), 'path')
 
