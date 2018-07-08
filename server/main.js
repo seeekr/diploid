@@ -29,8 +29,12 @@ const STATE_DIR = process.env.STATE_DIR || '.run/state'
 const DOCKER_CONFIG = `${STATE_DIR}/docker/config.json`
 
 const USE_GVISOR = process.env.USE_GVISOR != null
+const USE_KANIKO = process.env.USE_KANIKO != null
+const KANIKO_DOCKER_RUNTIME_ARG = USE_GVISOR ? '--runtime=runsc' : ''
 
 const HOOKS_TOKEN = process.env.HOOKS_TOKEN || 'GXqAJyrd0YSqJxJ6gBgx6hnuwaK8AZGO'
+
+const DEV = process.env.ENV === 'dev'
 
 let bootstrapConfig, config, gl, opsDir, opsGit, model, groupFile
 
@@ -106,6 +110,11 @@ const Router = require('koa-router')
 const router = new Router()
 
 router.post('/gitlab/hook', async function gitlabHook(ctx) {
+    if (!DEV && ctx.headers['x-gitlab-token'] !== HOOKS_TOKEN) {
+        ctx.status = 403
+        return
+    }
+
     await _init
 
     ctx.status = 200
@@ -164,7 +173,7 @@ router.post('/gitlab/hook', async function gitlabHook(ctx) {
             return
         }
 
-        await build(path, branch, e.checkout_sha.substr(0, 8))
+        await build(service, branch, e.checkout_sha.substr(0, 8))
         await deploy(model, service, branch)
     }
 
@@ -325,8 +334,8 @@ async function addHooks(model) {
     }
 }
 
-async function deploy(model, service, onlyBranch = null) {
-    console.log(`going to deploy ${model.name}/${service.name}:${onlyBranch || '(all envs)'}`)
+async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
+    console.log(`going to deploy ${model.name}/${service.name} - branch:${onlyBranch || '(all)'} env:${onlyEnv || '(all)'}`)
     const {name: serviceName, conf: serviceConf, deployments} = service
     let toDeploy
     if (deployments) {
@@ -354,14 +363,16 @@ async function deploy(model, service, onlyBranch = null) {
         })
     }
     for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports} of toDeploy) {
-        if (onlyBranch && branch !== onlyBranch) continue
+        if (onlyBranch && branch && branch !== onlyBranch) continue
+        if (onlyEnv && env !== onlyEnv) continue
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
-        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}` + (serviceConf.configure ? `-${env}` : '')
+        const tagExtra = (serviceConf.configure ? `-${env}` : '')
+        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}${tagExtra}`
 
         let imageConfig
         try {
-            imageConfig = await getImageConfig(imagePath, tag, registry, config.gitlab, config.user, config.gitlabToken)
+            imageConfig = await getImageConfig(imagePath, tag + tagExtra, registry, config.gitlab, config.user, config.gitlabToken)
         } catch (e) {
             if (e.statusCode === 404) {
                 // image is not there
@@ -371,10 +382,10 @@ async function deploy(model, service, onlyBranch = null) {
         }
         if (service.repo) {
             const repoPath = service.repo.fullPath
-            const gitDir = gitClone(repoPath, branch, tag)
+            const gitDir = await gitClone(repoPath, branch, tag)
             if (!imageConfig) {
                 if (!await fs.exists(`${gitDir}/Dockerfile`)) {
-                    console.log(`[status] image ${imagePath}:${tag} does not exist in registry ${registry}, and no Dockerfile in repo ${repoPath} branch ${branch} at ${tag} either -- cannot build, skipping!`)
+                    console.log(`[status] image ${imagePath}:${tag}${tagExtra} does not exist in registry ${registry}, and no Dockerfile in repo ${repoPath} branch ${branch} at ${tag} either -- cannot build, skipping!`)
                     continue
                 }
                 await build(service, branch, tag)
@@ -616,28 +627,38 @@ async function deploy(model, service, onlyBranch = null) {
         await sh(`kubectl apply -f ${file}`)
         console.log(`[status] deployed ${model.name}/${name}:${env}`)
     }
+
+    return toDeploy.length
 }
 
 async function build(service, branch, tag) {
-    const path = service.repo.fullPath
-    const gitDir = await gitClone(path, branch, tag)
+    const repoPath = service.repo.fullPath
+    const gitDir = await gitClone(repoPath, branch, tag)
 
-    const image = `${getRegistryUrl()}/${path}/${branch}:${tag}`
+    const image = `${getRegistryUrl()}/${repoPath}/${branch}:${tag}`
 
-    const runtimeArg = USE_GVISOR ? '--runtime=runsc' : ''
-    await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${image}'`)
+    console.log(`[status] building image ${image}...`)
+
+    if (USE_KANIKO) {
+        await sh(`docker run ${KANIKO_DOCKER_RUNTIME_ARG} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${image}'`)
+    } else {
+        await sh(`docker build -t '${image}' $(pwd)/${gitDir} && docker push '${image}'`)
+    }
 
     const {configure} = service.conf
     if (!configure) return
 
+    console.log(`[status] additional post-build configuration steps for ${image}`)
+
     const tmpDir = await fs.mkdtemp(os.tmpdir() + '/')
+    console.log(tmpDir)
     for (const depl of service.deployments.filter(it => it.branch === branch)) {
         const {env} = depl
         const envDir = `${tmpDir}/${env}`
-        const processed = Promise.all(
-            configure.entries()
-                .map(async ([file, props]) => [file, await sh(`docker run --rm ${image} cat ${file}`), props]),
-        )
+        const processed = (await Promise.all(
+            Object.entries(configure)
+                .map(async ([file, props]) => [file, props, await sh(`docker run --rm ${image} cat ${file}`)]),
+        ))
             .map(([file, props, content]) => processConfigure(model, depl, file, props, content))
         for (const [file, content] of processed) {
             // dump file back out
@@ -648,7 +669,14 @@ async function build(service, branch, tag) {
         await fs.writeFile(`${envDir}/Dockerfile`, `FROM ${image}\n` + Object.keys(configure).map(f => `COPY ${f} ${f}`).join('\n'), 'utf8')
         // send off to kaniko to build
         const envImage = `${image}-${env}`
-        await sh(`docker run ${runtimeArg} --rm -v $(pwd)/${envDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${envImage}'`)
+
+        console.log(`[status] building ${envImage}...`)
+
+        if (USE_KANIKO) {
+            await sh(`docker run ${KANIKO_DOCKER_RUNTIME_ARG} --rm -v ${envDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${envImage}'`)
+        } else {
+            await sh(`docker build -t '${envImage}' ${envDir} && docker push '${envImage}'`)
+        }
         await fs.remove(envDir)
     }
     await fs.remove(tmpDir)
