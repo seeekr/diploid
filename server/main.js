@@ -2,9 +2,11 @@ const fs = require('fs-extra')
 const os = require('os')
 const Gitlab = require('node-gitlab-api/dist/es5').default
 const {sh, safeEval, splitImage, interpolate, normalizeLogger} = require('../lib/lib')
-const {loadServiceConfig, processConfigure} = require('../lib/config')
+const {loadServiceConfig, processConfigure, evalPathExprs, parseAttrs} = require('../lib/config')
 const {getImageConfig, getExposedPorts} = require('../lib/registry')
 const {findConfigFiles} = require('../lib/diploid')
+const builds = require('../lib/builds')
+const buildPacks = require('../lib/build/packs')
 const globFiles = require('glob-promise')
 const glob = require('micromatch')
 const _ = require('lodash')
@@ -27,10 +29,6 @@ const SOURCE_DIR = process.env.SOURCE_DIR || '.run/sources'
 const STATE_DIR = process.env.STATE_DIR || '.run/state'
 
 const DOCKER_CONFIG = `${STATE_DIR}/docker/config.json`
-
-const USE_GVISOR = process.env.USE_GVISOR != null
-const USE_KANIKO = process.env.USE_KANIKO != null
-const KANIKO_DOCKER_RUNTIME_ARG = USE_GVISOR ? '--runtime=runsc' : ''
 
 const HOOKS_TOKEN = process.env.HOOKS_TOKEN || 'GXqAJyrd0YSqJxJ6gBgx6hnuwaK8AZGO'
 
@@ -74,7 +72,7 @@ async function init() {
     }
 
     {
-        const existed = await fs.exists(DOCKER_CONFIG)
+        const existed = await fs.pathExists(DOCKER_CONFIG)
         const prev = existed && await fs.readFile(DOCKER_CONFIG, 'utf8')
         if (!existed) {
             await fs.mkdirp(path.dirname(DOCKER_CONFIG))
@@ -253,6 +251,9 @@ async function loadModel() {
                         stale: moment(branch.lastCommit.date).isBefore(moment().subtract(60, 'days')),
                     }))
                     .filter(({stale, prod, merged}) => prod || (!stale && !merged))
+                const web = conf.web && parseAttrs(conf.web, {noPath: true}).attrs
+                const buildSteps = []
+                let packageType = web && web.static ? 'static' : undefined
                 const deployments = await Promise.all(
                     _.sortBy(repo.branches, b => prodBranchName && glob.isMatch(b.name, prodBranchName) ? 10000 + b.id : b.id)
                         .reverse()
@@ -278,6 +279,19 @@ async function loadModel() {
                                 }
                             }
 
+                            if (web) {
+                                if ('static' in web) {
+                                    const gitDir = await gitClone(repo.fullPath, branch.name, branch.lastCommit)
+                                    for (const p of Object.entries(buildPacks)) {
+                                        if (await p.applicable(gitDir)) {
+                                            buildSteps.push({buildPack: p.name})
+                                        }
+                                    }
+                                } else {
+                                    console.error(`unknown attributes on 'web' configuration item: ${Object.keys(web).join(', ')} - ignoring`)
+                                }
+                            }
+
                             return {
                                 repo: repo.fullPath,
                                 branch: branch.name,
@@ -285,6 +299,8 @@ async function loadModel() {
                                 commit: branch.lastCommit,
                                 prod: branch.prod,
                                 glob: isGlob,
+                                buildSteps,
+                                packageType,
                             }
                         }),
                 )
@@ -385,13 +401,13 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             }
         })
     }
-    for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports} of toDeploy) {
+    for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports, buildSteps, packageType} of toDeploy) {
         if (onlyBranch && branch && branch !== onlyBranch) continue
         if (onlyEnv && env !== onlyEnv) continue
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
         const tagExtra = (serviceConf.configure ? `-${env}` : '')
-        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}${tagExtra}`
+        let image = `${registry ? registry + '/' : ''}${imagePath}:${tag}${tagExtra}`
 
         let imageConfig
         try {
@@ -407,7 +423,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             const repoPath = service.repo.fullPath
             const gitDir = await gitClone(repoPath, branch, tag)
             if (!imageConfig) {
-                if (!await fs.exists(`${gitDir}/Dockerfile`)) {
+                if (!await fs.pathExists(`${gitDir}/Dockerfile`) && !buildSteps.length) {
                     console.log(`[status] image ${imagePath}:${tag}${tagExtra} does not exist in registry ${registry}, and no Dockerfile in repo ${repoPath} branch ${branch} at ${tag} either -- cannot build, skipping!`)
                     continue
                 }
@@ -515,6 +531,31 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             clusterIP = 'None'
         }
 
+        let initContainers
+        if (packageType === 'static') {
+            volumes.push({
+                name: 'static-files',
+                emptyDir: {},
+            })
+            initContainers = [{
+                name: 'copy-static-files',
+                image,
+                command: 'cp -r . /target'.split(' '),
+                volumeMounts: [{
+                    name: 'static-files',
+                    mountPath: '/target',
+                }],
+            }]
+            // replace image that just serves as source of static files with
+            // one that can actually deliver them: nginx
+            image = 'nginx:stable'
+            volumeMounts.push({
+                name: 'static-files',
+                mountPath: '/usr/share/nginx/html',
+            })
+            ports = [80]
+        }
+
         const items = [
             {
                 kind,
@@ -531,6 +572,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                         metadata: {labels},
                         spec: {
                             ...(nodeSelector ? {nodeSelector} : {}),
+                            initContainers,
                             containers: [
                                 {
                                     name,
@@ -543,10 +585,10 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                                                 value: typeof value === 'boolean' ? `${value}` : value,
                                             })),
                                     } : {}),
-                                    volumeMounts,
+                                    volumeMounts: volumeMounts.length ? volumeMounts : undefined,
                                 },
                             ],
-                            volumes,
+                            volumes: volumes.length ? volumes : undefined,
                             ...(affinity ? {affinity} : {}),
                         },
                     },
@@ -567,56 +609,66 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                 },
             },
         ]
-        if (conf.ingress == null || conf.ingress) {
-            const annotations = {
-                'kubernetes.io/ingress.class': 'nginx',
-                'kubernetes.io/tls-acme': 'true',
-                'ingress.kubernetes.io/ssl-redirect': 'true',
+        if (!('ingress' in conf) || conf.ingress) {
+            const defaultIngress = _.pick(conf, 'url', 'cors')
+            let ingresses
+            if (!_.isArray(conf.ingress)) {
+                ingresses = [conf.ingress]
             }
-            let {url} = conf
-            if (glob) {
-                url = `${url}/${branch}`
-            }
-            const URL = require('url').URL
-            url = new URL(interpolate(url, context))
-            const host = url.hostname
-            const path = url.pathname
+            ingresses = ingresses.map(it => !it || it === 'default' ? defaultIngress : {...defaultIngress, ...it})
+            for (const ingress of ingresses) {
+                let {url, cors} = ingress
+                if (glob) {
+                    url = `${url}/${branch}`
+                }
+                const URL = require('url').URL
+                url = new URL(interpolate(url, context))
+                const host = url.hostname
+                const path = url.pathname
 
-            const ingress = {
-                kind: 'Ingress',
-                apiVersion: 'extensions/v1beta1',
-                metadata: {
+                items.push(makeIngress({
                     name,
                     namespace,
                     labels,
-                    annotations,
-                },
-                spec: {
-                    tls: [{
-                        hosts: [host],
-                        secretName: `tls-${host.replace(/\./g, '-')}`,
-                    }],
-                    rules: [{
-                        host: host,
-                        http: {
-                            paths: [{
-                                path,
-                                backend: {serviceName: name, servicePort: ports[0]},
-                            }],
-                        },
-                    }],
-                },
+                    host,
+                    path,
+                    backend: {serviceName: name, servicePort: ports[0]},
+                    cors,
+                }))
             }
-            if (conf.cors) {
-                Object.assign(annotations, {
-                    'ingress.kubernetes.io/enable-cors': 'true',
-                    'ingress.kubernetes.io/cors-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                    'ingress.kubernetes.io/cors-allow-origin': '*',
-                    'ingress.kubernetes.io/cors-allow-headers': 'Authorization, Accept, Content-Type',
-                    'ingress.kubernetes.io/cors-allow-credentials': 'true',
-                })
+
+            if (conf.proxy) {
+                for (const [_localPath, target] of Object.entries(conf.proxy)) {
+                    const localPath = _localPath[0] === '/' ? _localPath : '/' + _localPath
+                    const pathId = localPath.replace(/[^a-zA-Z\-]+/g, '-').replace(/^-|-$/g, '')
+                    let serviceName, servicePort
+                    if (target.__pathExpr__) {
+                        const parts = target.__pathExpr__.split('.')
+                        if (parts.length !== 2) {
+                            console.error(`'proxy' allows only pairs of path --> services.serviceName type mappings; instead found: ${target.__pathExpr__} -- ignoring`)
+                            continue
+                        }
+                        const val = evalPathExprs(target, model, env, branch, prod)
+                        if (!val || !val.deploymentName) {
+                            console.error(`invalid service reference: ${target.__pathExpr__} -- ignoring`)
+                            continue
+                        }
+                        serviceName = val.deploymentName
+                        servicePort = val.port
+                    } else {
+                        console.error(`unsupported proxy target: ${JSON.stringify(target)} -- ignoring`)
+                        continue
+                    }
+                    items.push(makeIngress({
+                        name: `${name}-proxy-${pathId}`,
+                        namespace,
+                        labels,
+                        host,
+                        path: `${path}${localPath}`,
+                        backend: {serviceName, servicePort},
+                    }))
+                }
             }
-            items.push(ingress)
         }
 
         const out = items
@@ -654,6 +706,65 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
     return toDeploy.length
 }
 
+function makeIngress({name, namespace, labels, annotations = {}, host, path, cors, backend: {serviceName, servicePort}}) {
+    annotations = Object.assign({
+        'kubernetes.io/ingress.class': 'nginx',
+        'kubernetes.io/tls-acme': 'true',
+        'ingress.kubernetes.io/ssl-redirect': 'true',
+    }, annotations)
+
+    const ingress = {
+        kind: 'Ingress',
+        apiVersion: 'extensions/v1beta1',
+        metadata: {
+            name,
+            namespace,
+            labels,
+            annotations,
+        },
+        spec: {
+            tls: [{
+                hosts: [host],
+                secretName: `tls-${host.replace(/\./g, '-')}`,
+            }],
+            rules: [{
+                host: host,
+                http: {
+                    paths: [{
+                        path,
+                        backend: {serviceName, servicePort},
+                    }],
+                },
+            }],
+        },
+    }
+    if (cors) {
+        Object.assign(annotations, {
+            'ingress.kubernetes.io/enable-cors': 'true',
+            'ingress.kubernetes.io/cors-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'ingress.kubernetes.io/cors-allow-origin': '*',
+            'ingress.kubernetes.io/cors-allow-headers': 'Authorization, Accept, Content-Type',
+            'ingress.kubernetes.io/cors-allow-credentials': 'true',
+        })
+    }
+    return ingress
+}
+
+async function buildImage(dockerfile, sources, image, {local} = null) {
+    await sh(`docker build ${dockerfile ? '-f' + dockerfile : ''} -t '${image}' ${sources}`)
+    if (!local) {
+        await sh(`docker push '${image}'`)
+    }
+}
+
+async function skipIntermediateDirs(dir) {
+    const children = await fs.readdir(dir)
+    if (children.length === 1) {
+        return skipIntermediateDirs(path.join(dir, children[0]))
+    }
+    return dir
+}
+
 async function build(service, branch, tag) {
     const repoPath = service.repo.fullPath
     const gitDir = await gitClone(repoPath, branch, tag)
@@ -662,19 +773,72 @@ async function build(service, branch, tag) {
 
     console.log(`[status] building image ${image}...`)
 
-    if (USE_KANIKO) {
-        await sh(`docker run ${KANIKO_DOCKER_RUNTIME_ARG} --rm -v $(pwd)/${gitDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${image}'`)
-    } else {
-        await sh(`docker build -t '${image}' $(pwd)/${gitDir} && docker push '${image}'`)
+    const deployments = service.deployments.filter(it => it.branch === branch)
+    // it should be fine to use config info from just the first deployment
+    // because the relevant config is decided because of the branch, and that
+    // is the same for all of the deployments to be done here
+    const {buildSteps, packageType} = (deployments[0] || {buildSteps: []})
+
+    const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/`)
+
+    let dockerfile = `${gitDir}/Dockerfile`
+    let buildDir = `${process.cwd()}/${gitDir}`
+    if (!await fs.pathExists(dockerfile)) {
+        assert.ok(buildSteps.length)
+
+        // generate a dockerfile
+        const lines = []
+        const packs = builds.order(buildSteps.map(s => s.buildPack))
+
+        const baseImages = builds.commonBaseImage(packs)
+        if (baseImages.length !== 1) {
+            console.error(`couldn't figure out base image for build steps: ${JSON.stringify(buildSteps)} -- result: ${baseImages.join(', ')}`)
+        }
+        lines.push(`FROM ${baseImages}`)
+
+        lines.push(`WORKDIR /app`)
+
+        lines.push(...await builds.preBuild(packs, gitDir))
+
+        lines.push('ADD . ./')
+
+        lines.push(...await builds.build(packs, gitDir))
+
+        dockerfile = `${tmpDir}/Dockerfile`
+        await fs.writeFile(dockerfile, lines.join('\n'), 'utf8')
+
+        if (packageType) {
+            // not done yet, need to package stuff up first
+
+            if (packageType === 'static') {
+                // build image, run image to copy its output, compare output with input, infer what the output dir is
+                const localImage = `${repoPath}/${branch}:${tag}-prePackage`
+                await buildImage(dockerfile, gitDir, localImage, {local: true})
+                const outDir = `${tmpDir}/prePackage/static/out`
+                await sh(`docker run --rm -v ${outDir}:/out cp -r . /out`)
+
+                const ignore = (await sh(`cat ${outDir}/{.git,.docker}ignore | sort | uniq`)).split('\n').filter(it => it)
+                const dirs = (await sh(`find ${outDir} -type d`)).split('\n').filter(it => it)
+                    .filter(it => it[0] === '.')
+                    .filter(it => ignore.every(i => !glob.isMatch(it, i)))
+                const dir = dirs.length === 1 ? skipIntermediateDirs(dirs[0]) : outDir
+
+                await fs.writeFile(dockerfile, `FROM alpine\nWORKDIR /source\nADD . ./\nCMD cp -r . /target`, 'utf8')
+                buildDir = dir
+            } else {
+                throw new Error(`unknown package type: ${packageType}`)
+            }
+        }
     }
+
+    await buildImage(dockerfile, buildDir, image)
 
     const {configure} = service.conf
     if (!configure) return
 
     console.log(`[status] additional post-build configuration steps for ${image}`)
 
-    const tmpDir = await fs.mkdtemp(os.tmpdir() + '/')
-    for (const depl of service.deployments.filter(it => it.branch === branch)) {
+    for (const depl of deployments) {
         const {env} = depl
         const envDir = `${tmpDir}/${env}`
         const processed = (await Promise.all(
@@ -693,12 +857,7 @@ async function build(service, branch, tag) {
         const envImage = `${image}-${env}`
 
         console.log(`[status] building ${envImage}...`)
-
-        if (USE_KANIKO) {
-            await sh(`docker run ${KANIKO_DOCKER_RUNTIME_ARG} --rm -v ${envDir}:/workspace -v $(pwd)/${DOCKER_CONFIG}:/root/.docker/config.json:ro gcr.io/kaniko-project/executor --destination='${envImage}'`)
-        } else {
-            await sh(`docker build -t '${envImage}' ${envDir} && docker push '${envImage}'`)
-        }
+        await buildImage(null, envDir, envImage)
         await fs.remove(envDir)
     }
     await fs.remove(tmpDir)
@@ -710,12 +869,12 @@ function getGitPath(path, branch) {
 
 async function gitClone(path, branch = null, tag = null) {
     const targetDir = getGitPath(path, branch)
-    if (!await fs.exists(targetDir)) {
+    if (!await fs.pathExists(targetDir)) {
         await sh(`git clone 'https://${config.user}:${config.gitlabToken}@${config.gitlab}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
         if (tag) {
             await sh(`cd ${targetDir} git checkout ${tag}`)
         }
-    } else if (await fs.exists(`${targetDir}/.git`)) {
+    } else if (await fs.pathExists(`${targetDir}/.git`)) {
         // later/bug: assuming that default branch is "master", which could be completely wrong
         await sh(`cd ${targetDir} && git fetch --all && git checkout ${tag || branch || 'master'}`)
     } else if (process.env.NODE_ENV === 'dev') {
