@@ -11,7 +11,7 @@ describe('config', function () {
     })
 
     describe('processConfigure', function () {
-        it.only('should apply configured changes to the given file', function () {
+        it('should apply configured changes to the given file', function () {
             const model = {
                 services: [
                     {
