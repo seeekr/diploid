@@ -39,27 +39,30 @@ let bootstrapConfig, config, gl, opsDir, opsGit, model, groupFile
 
 async function init() {
     // load bootstrap config, fetch repo, read full config -- after that we can proceed with full information
-    bootstrapConfig = config = JSON.parse(await fs.readFile(`${CONFIG_DIR}/config.json`, 'utf8'))
+    bootstrapConfig = JSON.parse(await fs.readFile(`${CONFIG_DIR}/config.json`, 'utf8'))
 
     await fs.mkdirp(SOURCE_DIR)
-    opsDir = await gitClone(config.opsRepo)
+    opsDir = await gitClone(bootstrapConfig.opsRepo)
 
     opsGit = new Git(opsDir)
 
     const groupFiles = await findConfigFiles(opsDir)
     if (groupFiles.length !== 1) {
-        throw new Error(`expected to find exactly one '${ENV_CONF_NAME}' file in project ${config.opsRepo}, found ${groupFiles.length}`)
+        throw new Error(`expected to find exactly one '${ENV_CONF_NAME}' file in project ${bootstrapConfig.opsRepo}, found ${groupFiles.length}`)
     }
     groupFile = groupFiles[0]
 
     console.log(`[status] initialized from group file: ${groupFile}`)
 
     gl = new Gitlab({
-        url: `https://${config.gitlab}`,
-        token: config.gitlabToken,
+        url: `https://${bootstrapConfig.gitlab}`,
+        token: bootstrapConfig.gitlabToken,
     })
 
-    model = await loadModel()
+    // load model using an initial group config so that the global 'config' var is already set to something usable;
+    // setting it to the full one right after that call
+    const initialGroupConfig = config = await loadGroupConfig()
+    model = await loadModel(initialGroupConfig)
     config = model.conf
 
     // create docker config.json with registry auth
@@ -218,16 +221,20 @@ function normalizeDomain(config) {
     return config
 }
 
-async function loadModel() {
-    console.log('(re-)loading model')
-    const groupConf = _.merge({
+async function loadGroupConfig() {
+    return normalizeDomain(_.merge({
         services: {defaults: {}},
-    }, bootstrapConfig, safeEval(await fs.readFile(groupFile, 'utf8')))
-    normalizeDomain(groupConf)
+    }, bootstrapConfig, safeEval(await fs.readFile(groupFile, 'utf8'))))
+}
+
+async function loadModel(groupConf) {
+    console.log('(re-)loading model')
+    groupConf = groupConf || await loadGroupConfig()
 
     const NON_ENV_KEYS = ['domain', 'services', 'gitlabToken', 'registry', 'user', 'vars']
     const groupEnvConfigs = _.omit(groupConf, NON_ENV_KEYS)
     const repos = _.keyBy(await loadRepos(), 'path')
+    const registry = getRegistryUrl()
 
     const services = (await Promise.all(
         (await getServiceConfigs(path.dirname(groupFile))).map(async ([name, k8sConf]) => {
@@ -258,63 +265,85 @@ async function loadModel() {
                 const web = conf.web
                 let packageType = web && web.static ? 'static' : undefined
                 const deployments = await Promise.all(
-                    _.sortBy(repo.branches, b => prodBranchName && glob.isMatch(b.name, prodBranchName) ? 10000 + b.id : b.id)
-                        .reverse()
-                        .map(async branch => {
-                            // match branch to target environment
-                            let env = branchToEnv[branch.name]
-                            let isGlob = null
-                            if (!env) {
-                                const results = Object.entries(branchToEnv).map(([pattern, targetEnv]) => ([glob.isMatch(branch.name, pattern), pattern, targetEnv]))
-                                let curMatch = null
-                                let curGlob = null
-                                for (const [matches, pattern, targetEnv] of results) {
-                                    if (!matches) continue
-                                    let isGlob = pattern.includes('*')
-                                    if (!curMatch || (curGlob && !isGlob) || targetEnv.length > curMatch.length) {
-                                        env = targetEnv
-                                        curMatch = pattern
-                                        curGlob = isGlob
-                                    }
-                                }
-                                if (env) {
-                                    isGlob = curGlob
-                                }
-                            }
-
-                            const buildSteps = []
-
-                            if (web) {
-                                const handled = {}
-                                if ('static' in web) {
-                                    const gitDir = await gitClone(repo.fullPath, branch.name, branch.lastCommit.id)
-                                    for (const [name, p] of Object.entries(buildPacks)) {
-                                        if (await p.applicable(gitDir)) {
-                                            buildSteps.push({buildPack: name})
+                    (await Promise.all(
+                        _.sortBy(repo.branches, b => prodBranchName && glob.isMatch(b.name, prodBranchName) ? 10000 + b.id : b.id)
+                            .reverse()
+                            .map(async branch => {
+                                // match branch to target environment
+                                let env = branchToEnv[branch.name]
+                                let isGlob = null
+                                if (!env) {
+                                    const results = Object.entries(branchToEnv).map(([pattern, targetEnv]) => ([glob.isMatch(branch.name, pattern), pattern, targetEnv]))
+                                    let curMatch = null
+                                    let curGlob = null
+                                    for (const [matches, pattern, targetEnv] of results) {
+                                        if (!matches) continue
+                                        let isGlob = pattern.includes('*')
+                                        if (!curMatch || (curGlob && !isGlob) || targetEnv.length > curMatch.length) {
+                                            env = targetEnv
+                                            curMatch = pattern
+                                            curGlob = isGlob
                                         }
                                     }
-                                    handled.static = true
+                                    if (env) {
+                                        isGlob = curGlob
+                                    }
                                 }
-                                if (web.spa) {
-                                    handled.spa = true
-                                }
-                                const unhandled = _.omit(web, Object.keys(handled))
-                                if (Object.keys(unhandled).length) {
-                                    console.error(`unknown attributes on 'web' configuration item: ${Object.keys(unhandled).join(', ')} - ignoring`)
-                                }
-                            }
 
-                            return {
-                                repo: repo.fullPath,
-                                branch: branch.name,
-                                env,
-                                commit: branch.lastCommit,
-                                prod: branch.prod,
-                                glob: isGlob,
-                                buildSteps,
-                                packageType,
-                            }
-                        }),
+                                const buildSteps = []
+
+                                if (web) {
+                                    const handled = {}
+                                    if (web.static) {
+                                        const gitDir = await gitClone(repo.fullPath, branch.name, branch.lastCommit.id)
+                                        for (const [name, p] of Object.entries(buildPacks)) {
+                                            if (await p.applicable(gitDir)) {
+                                                buildSteps.push({buildPack: name})
+                                            }
+                                        }
+                                        handled.static = true
+                                    }
+                                    if (web.spa) {
+                                        handled.spa = true
+                                    }
+                                    const unhandled = _.omit(web, Object.keys(handled))
+                                    if (Object.keys(unhandled).length) {
+                                        console.error(`unknown attributes on 'web' configuration item: ${Object.keys(unhandled).join(', ')} - ignoring`)
+                                    }
+                                }
+
+                                return {
+                                    repo: repo.fullPath,
+                                    branch: branch.name,
+                                    env,
+                                    commit: branch.lastCommit,
+                                    prod: branch.prod,
+                                    glob: isGlob,
+                                    buildSteps,
+                                    packageType,
+                                }
+                            }),
+                    )).map(async ({repo, branch, env, commit, glob, prod, buildSteps, packageType}) => {
+                        const tagExtra = (conf.configure ? `-${env}` : '')
+                        const imagePath = `${repo}/${branch}`
+                        const tag = commit.short
+                        const image = `${registry ? registry + '/' : ''}${imagePath}:${tag}${tagExtra}`
+                        return await addPorts({
+                            repo,
+                            branch,
+                            env,
+                            commit,
+                            glob,
+                            prod,
+                            buildSteps,
+                            packageType,
+                            registry,
+                            imagePath,
+                            tag,
+                            tagExtra,
+                            image,
+                        }, imagePath, `${tag}${tagExtra}`, true)
+                    }),
                 )
                 Object.assign(service, {repo, deployments})
             } else {
@@ -385,53 +414,44 @@ async function addHooks(model) {
     }
 }
 
+function resolveUrl(url, branch, glob, context) {
+    if (glob) {
+        url = `${url}/${branch}`
+    }
+    const URL = require('url').URL
+    url = new URL(interpolate(url, context))
+    const host = url.hostname
+    const path = url.pathname
+    return {host, path}
+}
+
 async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
     console.log(`going to deploy ${model.name}/${service.name} - branch:${onlyBranch || '(all)'} env:${onlyEnv || '(all)'}`)
     const {name: serviceName, conf: serviceConf, deployments} = service
-    let toDeploy
-    if (deployments) {
-        toDeploy = deployments.map(({repo, branch, env, commit, glob, prod, ports, buildSteps, packageType}) => ({
+    const toDeploy = deployments || _.uniq(['production', ...Object.keys(serviceConf.byEnv || {})]).map(env => {
+        const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
+        const [imagePath, tag] = splitImage(conf.image)
+        return {
             env,
-            imagePath: `${repo}/${branch}`,
-            tag: commit.short,
-            registry: getRegistryUrl(),
-            branch,
-            glob,
-            prod,
-            ports,
-            buildSteps,
-            packageType,
-        }))
-    } else {
-        toDeploy = _.uniq(['production', ...Object.keys(serviceConf.byEnv || {})]).map(env => {
-            const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
-            const [imagePath, tag] = splitImage(conf.image)
-            return {
-                env,
-                imagePath,
-                tag,
-                prod: env === 'production',
-                ports: conf.ports,
-            }
-        })
-    }
-    for (const {env, imagePath, tag, registry, branch, glob, prod, ports: _ports, buildSteps, packageType} of toDeploy) {
+            imagePath,
+            tag,
+            prod: env === 'production',
+            ports: conf.ports,
+        }
+    })
+
+    for (const {env, imagePath, tag, tagExtra, image: _image, registry, branch, glob, prod, ports: _ports, buildSteps, packageType} of toDeploy) {
         if (onlyBranch && branch && branch !== onlyBranch) continue
         if (onlyEnv && env !== onlyEnv) continue
 
         const conf = Object.assign({}, serviceConf, (serviceConf.byEnv || {})[env])
-        const tagExtra = (serviceConf.configure ? `-${env}` : '')
-        let image = `${registry ? registry + '/' : ''}${imagePath}:${tag}${tagExtra}`
+        let image = _image
 
         let imageConfig
         try {
             imageConfig = await getImageConfig(imagePath, tag + tagExtra, registry, config.gitlab, config.user, config.gitlabToken)
         } catch (e) {
-            if (e.statusCode === 404) {
-                // image is not there
-            } else {
-                console.log('failed to read image config', e)
-            }
+            handleImageGetException(e)
         }
         if (service.repo) {
             const repoPath = service.repo.fullPath
@@ -547,7 +567,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
 
         const items = []
 
-        let initContainers
+        let initContainers = []
         if (packageType === 'static') {
             volumes.push({
                 name: 'static-files',
@@ -624,7 +644,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                         metadata: {labels},
                         spec: {
                             ...(nodeSelector ? {nodeSelector} : {}),
-                            initContainers,
+                            ...(initContainers.length ? {initContainers} : {}),
                             containers: [
                                 {
                                     name,
@@ -637,10 +657,10 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                                                 value: typeof value === 'boolean' ? `${value}` : value,
                                             })),
                                     } : {}),
-                                    volumeMounts: volumeMounts.length ? volumeMounts : undefined,
+                                    ...(volumeMounts.length ? {volumeMounts} : {}),
                                 },
                             ],
-                            volumes: volumes.length ? volumes : undefined,
+                            ...(volumes.length ? {volumes} : {}),
                             ...(affinity ? {affinity} : {}),
                         },
                     },
@@ -661,22 +681,16 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                 },
             },
         ])
+        const defaultIngress = _.pick(conf, 'url', 'cors')
         if (!('ingress' in conf) || conf.ingress) {
-            const defaultIngress = _.pick(conf, 'url', 'cors')
-            let ingresses
+            let ingresses = conf.ingress || 'default'
             if (!_.isArray(conf.ingress)) {
                 ingresses = [conf.ingress]
             }
-            ingresses = ingresses.map(it => !it || it === 'default' ? defaultIngress : {...defaultIngress, ...it})
+            ingresses = ingresses.map(it => !it || it === true || it === 'default' ? defaultIngress : {...defaultIngress, ...it})
             for (const ingress of ingresses) {
                 let {url, cors} = ingress
-                if (glob) {
-                    url = `${url}/${branch}`
-                }
-                const URL = require('url').URL
-                url = new URL(interpolate(url, context))
-                const host = url.hostname
-                const path = url.pathname
+                const {host, path} = resolveUrl(url, branch, glob, context)
 
                 items.push(makeIngress({
                     name,
@@ -705,12 +719,21 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                             console.error(`invalid service reference: ${target.__pathExpr__} -- ignoring`)
                             continue
                         }
+                        if (!val.port) {
+                            console.error(`no service port known for ${val.deploymentName}, resolved from ${target.__pathExpr__} -- ignoring`)
+                            continue
+                        }
                         serviceName = val.deploymentName
                         servicePort = val.port
                     } else {
                         console.error(`unsupported proxy target: ${JSON.stringify(target)} -- ignoring`)
                         continue
                     }
+                    if (!serviceName || !servicePort) {
+                        console.error(`proxy without service name or port: ${serviceName}:${servicePort} for ${localPath} -- ignoring`)
+                        continue
+                    }
+                    const {host, path} = resolveUrl(defaultIngress.url, branch, glob, context)
                     items.push(makeIngress({
                         name: `${name}-proxy-${pathId}`,
                         namespace,
@@ -867,9 +890,10 @@ async function build(service, branch, tag) {
                 const localImage = `${repoPath}/${branch}:${tag}-prePackage`
                 await buildImage(dockerfile, gitDir, localImage, {local: true})
                 const outDir = `${tmpDir}/prePackage/static/out`
-                await sh(`docker run --rm -v ${outDir}:/out cp -r . /out`)
+                await fs.mkdirp(outDir)
+                await sh(`docker run --rm -v ${await fs.realpath(outDir)}:/target ${localImage} cp -r . /target`)
 
-                const ignore = (await sh(`cat ${outDir}/{.git,.docker}ignore | sort | uniq`)).split('\n').filter(it => it)
+                const ignore = (await sh(`cat ${outDir}/{.git,.docker}ignore 2>/dev/null | sort | uniq`)).split('\n').filter(it => it)
                 const dirs = (await sh(`find ${outDir} -type d`)).split('\n').filter(it => it)
                     .filter(it => it[0] === '.')
                     .filter(it => ignore.every(i => !glob.isMatch(it, i)))
@@ -929,7 +953,7 @@ async function gitClone(path, branch = null, tag = null) {
     } else if (await fs.pathExists(`${targetDir}/.git`)) {
         // later/bug: assuming that default branch is "master", which could be completely wrong
         await sh(`cd ${targetDir} && git fetch --all && git checkout ${tag || branch || 'master'}`)
-    } else if (process.env.NODE_ENV === 'dev') {
+    } else if (DEV) {
         // OK to work with predefined non-git folder in development
         return targetDir
     } else {
@@ -980,15 +1004,25 @@ function getRegistryUrl() {
     return `${host || config.gitlab}${port ? ':' + port : ''}`
 }
 
-async function addPorts(service, imagePath, tag = 'latest', gitlabRegistry = false) {
+function handleImageGetException(e) {
+    if (e.statusCode === 404) {
+        // image is not there
+    } else if (e.statusCode === 401) {
+        console.error(`got 401 while loading image configuration -- is the registry enabled for this project?`, e.message)
+    } else {
+        console.error('failed to read image config', e.message)
+    }
+}
+
+async function addPorts(conf, imagePath, tag = 'latest', gitlabRegistry = false) {
     try {
         const imageConfig = await getImageConfig(imagePath, tag, ...(gitlabRegistry ? [getRegistryUrl(), config.gitlab, config.user, config.gitlabToken] : []))
         const ports = getExposedPorts(imageConfig)
         if (ports && ports.length) {
-            service.ports = ports
+            conf.ports = ports
         }
     } catch (e) {
-        // ignore here, image may not have been built yet
+        handleImageGetException(e)
     }
-    return service
+    return conf
 }
