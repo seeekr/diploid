@@ -1,5 +1,6 @@
 const fs = require('fs-extra')
 const os = require('os')
+const assert = require('assert')
 const Gitlab = require('node-gitlab-api/dist/es5').default
 const {sh, safeEval, splitImage, interpolate, normalizeLogger} = require('../lib/lib')
 const {loadServiceConfig, processConfigure, evalPathExprs, parseAttrs} = require('../lib/config')
@@ -251,8 +252,10 @@ async function loadModel() {
                         stale: moment(branch.lastCommit.date).isBefore(moment().subtract(60, 'days')),
                     }))
                     .filter(({stale, prod, merged}) => prod || (!stale && !merged))
-                const web = conf.web && parseAttrs(conf.web, {noPath: true}).attrs
-                const buildSteps = []
+                if (conf.web) {
+                    conf.web = parseAttrs(conf.web, {noPath: true}).attrs
+                }
+                const web = conf.web
                 let packageType = web && web.static ? 'static' : undefined
                 const deployments = await Promise.all(
                     _.sortBy(repo.branches, b => prodBranchName && glob.isMatch(b.name, prodBranchName) ? 10000 + b.id : b.id)
@@ -279,16 +282,25 @@ async function loadModel() {
                                 }
                             }
 
+                            const buildSteps = []
+
                             if (web) {
+                                const handled = {}
                                 if ('static' in web) {
-                                    const gitDir = await gitClone(repo.fullPath, branch.name, branch.lastCommit)
-                                    for (const p of Object.entries(buildPacks)) {
+                                    const gitDir = await gitClone(repo.fullPath, branch.name, branch.lastCommit.id)
+                                    for (const [name, p] of Object.entries(buildPacks)) {
                                         if (await p.applicable(gitDir)) {
-                                            buildSteps.push({buildPack: p.name})
+                                            buildSteps.push({buildPack: name})
                                         }
                                     }
-                                } else {
-                                    console.error(`unknown attributes on 'web' configuration item: ${Object.keys(web).join(', ')} - ignoring`)
+                                    handled.static = true
+                                }
+                                if (web.spa) {
+                                    handled.spa = true
+                                }
+                                const unhandled = _.omit(web, Object.keys(handled))
+                                if (Object.keys(unhandled).length) {
+                                    console.error(`unknown attributes on 'web' configuration item: ${Object.keys(unhandled).join(', ')} - ignoring`)
                                 }
                             }
 
@@ -378,7 +390,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
     const {name: serviceName, conf: serviceConf, deployments} = service
     let toDeploy
     if (deployments) {
-        toDeploy = deployments.map(({repo, branch, env, commit, glob, prod, ports}) => ({
+        toDeploy = deployments.map(({repo, branch, env, commit, glob, prod, ports, buildSteps, packageType}) => ({
             env,
             imagePath: `${repo}/${branch}`,
             tag: commit.short,
@@ -387,6 +399,8 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             glob,
             prod,
             ports,
+            buildSteps,
+            packageType,
         }))
     } else {
         toDeploy = _.uniq(['production', ...Object.keys(serviceConf.byEnv || {})]).map(env => {
@@ -531,6 +545,8 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             clusterIP = 'None'
         }
 
+        const items = []
+
         let initContainers
         if (packageType === 'static') {
             volumes.push({
@@ -556,7 +572,43 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
             ports = [80]
         }
 
-        const items = [
+        if (conf.web && conf.web.spa) {
+            const [imgPath] = splitImage(image)
+            // we'll be optimistic and assume that any image called "nginx" will be working sufficiently
+            // similarly to stock nginx such that we can hook into it and make it do the things we want
+            if (imgPath.replace(/^.*\//, '') === 'nginx') {
+                const spaTarget = typeof conf.web.spa === 'string' ? conf.web.spa : '/index.html'
+                const cmName = `${name}-nginx-spa`
+                items.push({
+                    kind: 'ConfigMap',
+                    apiVersion: 'v1',
+                    metadata: {
+                        name: cmName,
+                        namespace,
+                        labels,
+                    },
+                    data: {
+                        'spa.conf': `server {
+    location / {
+        try_files $uri $uri/ ${spaTarget};
+    }
+}`,
+                    },
+                })
+                volumes.push({
+                    name: 'nginx-spa',
+                    configMap: {name: cmName, items: [{key: 'spa.conf', path: 'spa.conf'}]},
+                })
+                volumeMounts.push({
+                    name: 'nginx-spa',
+                    mountPath: '/etc/nginx/conf.d',
+                })
+            } else {
+                console.error(`image ${image} is not an nginx image, don't know how to inject SPA configuration into it; skipping`)
+            }
+        }
+
+        items.push(...[
             {
                 kind,
                 apiVersion: 'apps/v1',
@@ -608,7 +660,7 @@ async function deploy(model, service, onlyBranch = null, onlyEnv = null) {
                     selector: labels,
                 },
             },
-        ]
+        ])
         if (!('ingress' in conf) || conf.ingress) {
             const defaultIngress = _.pick(conf, 'url', 'cors')
             let ingresses
@@ -750,8 +802,8 @@ function makeIngress({name, namespace, labels, annotations = {}, host, path, cor
     return ingress
 }
 
-async function buildImage(dockerfile, sources, image, {local} = null) {
-    await sh(`docker build ${dockerfile ? '-f' + dockerfile : ''} -t '${image}' ${sources}`)
+async function buildImage(dockerfile, sources, image, {local} = {}) {
+    await sh(`docker build ${dockerfile ? '-f ' + dockerfile : ''} -t '${image}' ${sources}`)
     if (!local) {
         await sh(`docker push '${image}'`)
     }
@@ -788,7 +840,7 @@ async function build(service, branch, tag) {
 
         // generate a dockerfile
         const lines = []
-        const packs = builds.order(buildSteps.map(s => s.buildPack))
+        const packs = builds.resolve(buildSteps.map(s => s.buildPack)).filter(p => p.applicable(gitDir))
 
         const baseImages = builds.commonBaseImage(packs)
         if (baseImages.length !== 1) {
