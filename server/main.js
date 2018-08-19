@@ -398,7 +398,7 @@ async function addHooks(model) {
         hookUrl = process.env.INGRESS_URL
     } else {
         const ingress = JSON.parse(await sh(`kubectl get ing diploid -n diploid -o json`))
-        hookUrl = `https://${ingress.spec.rules[0].host}${ingress.spec.rules[0].paths[0].path}`
+        hookUrl = `https://${ingress.spec.rules[0].host}${ingress.spec.rules[0].http.paths[0].path}`
     }
     hookUrl += '/gitlab/hook'
     for (const repo of [model.repo, ..._.map(model.services, 'repo').filter(it => it)]) {
