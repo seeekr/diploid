@@ -10,7 +10,7 @@ const git = require('simple-git/promise')('.')
 module.exports = {
     command: 'init',
     async handler() {
-        if (!await fs.pathExists('.git')) {
+        if ((await sh(`git status > /dev/null && echo ok || true`)) !== 'ok') {
             console.error(`needs to be called from a git repository`)
             process.exit(1)
         }

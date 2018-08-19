@@ -785,7 +785,7 @@ function makeIngress({name, namespace, labels, annotations = {}, host, path, cor
     annotations = Object.assign({
         'kubernetes.io/ingress.class': 'nginx',
         'kubernetes.io/tls-acme': 'true',
-        'ingress.kubernetes.io/ssl-redirect': 'true',
+        'nginx.ingress.kubernetes.io/ssl-redirect': 'true',
     }, annotations)
 
     const ingress = {
@@ -815,11 +815,11 @@ function makeIngress({name, namespace, labels, annotations = {}, host, path, cor
     }
     if (cors) {
         Object.assign(annotations, {
-            'ingress.kubernetes.io/enable-cors': 'true',
-            'ingress.kubernetes.io/cors-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
-            'ingress.kubernetes.io/cors-allow-origin': '*',
-            'ingress.kubernetes.io/cors-allow-headers': 'Authorization, Accept, Content-Type',
-            'ingress.kubernetes.io/cors-allow-credentials': 'true',
+            'nginx.ingress.kubernetes.io/enable-cors': 'true',
+            'nginx.ingress.kubernetes.io/cors-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'nginx.ingress.kubernetes.io/cors-allow-origin': '*',
+            'nginx.ingress.kubernetes.io/cors-allow-headers': 'Authorization, Accept, Content-Type',
+            'nginx.ingress.kubernetes.io/cors-allow-credentials': 'true',
         })
     }
     return ingress
@@ -946,7 +946,8 @@ function getGitPath(path, branch) {
 async function gitClone(path, branch = null, tag = null) {
     const targetDir = getGitPath(path, branch)
     if (!await fs.pathExists(targetDir)) {
-        await sh(`git clone 'https://${config.user}:${config.gitlabToken}@${config.gitlab}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
+        const conf = config || bootstrapConfig
+        await sh(`git clone 'https://${conf.user}:${conf.gitlabToken}@${conf.gitlab}/${path}' ${targetDir}${branch ? ' -b ' + branch : ''}`)
         if (tag) {
             await sh(`cd ${targetDir} git checkout ${tag}`)
         }
