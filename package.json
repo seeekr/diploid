@@ -35,7 +35,7 @@
     "koa": "^2.5.0",
     "koa-body": "^2.5.0",
     "koa-router": "^7.4.0",
-    "lodash": "^4.17.5",
+    "lodash": "^4.17.19",
     "micromatch": "^3.1.10",
     "moment": "^2.22.1",
     "node-gitlab-api": "^3.0.2",
